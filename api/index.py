@@ -12,7 +12,7 @@ Flow:
   3. Digital PDF  -> extract text with pdfplumber (free, instant)
      Scanned PDF  -> send to OCR.space API to get plain text (free, 500 req/day)
   4. Gatekeeper: if "Delivery Order" not in text -> return {document_type: "other"}
-  5. Extraction: parse header, customer, ship_to, product_selection table
+  5. Extraction: regex-based parsing that handles OCR spacing variations
   6. Return structured JSON matching the Grove PDF Router schema
 
 Environment variables required on Vercel:
@@ -25,7 +25,6 @@ import re
 import cgi
 import os
 import urllib.request
-import urllib.parse
 import urllib.error
 import pdfplumber
 from http.server import BaseHTTPRequestHandler
@@ -38,7 +37,7 @@ def is_scanned_pdf(pdf_bytes):
     try:
         with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
             total_chars = sum(len(page.chars) for page in pdf.pages)
-            return total_chars < 20  # fewer than 20 chars = scanned
+            return total_chars < 20
     except Exception:
         return True
 
@@ -46,620 +45,509 @@ def is_scanned_pdf(pdf_bytes):
 def extract_text_with_pdfplumber(pdf_bytes):
     """Extract text from a digital PDF using pdfplumber."""
     with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
-        lines = []
+        pages = []
         for page in pdf.pages:
             text = page.extract_text() or ""
-            lines.append(text)
-        return "\n".join(lines)
+            pages.append(text)
+        return "\n".join(pages)
 
 
 def extract_text_with_ocrspace(pdf_bytes):
     """
-    Send a single-page PDF to OCR.space API and return extracted plain text.
-    Free tier: 500 requests/day, no per-second rate limit, no page size limit.
-    Each page arrives here already split by the Grove PDF Router — always 1 page.
-
-    Environment variable: OCR_SPACE_API_KEY
-    Get a free key at: https://ocr.space/ocrapi/freekey
+    Send a single-page PDF to OCR.space and return plain text.
+    Free tier: 500 requests/day, no per-second rate limit.
+    Each page arrives already split by the Grove PDF Router.
     """
     api_key = os.environ.get("OCR_SPACE_API_KEY", "helloworld")
-    # Note: "helloworld" is OCR.space's public test key — severely rate limited.
-    # Always set OCR_SPACE_API_KEY in Vercel environment variables.
 
-    # OCR.space accepts multipart/form-data with the file as a field named "file"
     boundary = "----GrovePDFBoundary"
     body_parts = []
 
-    # -- apikey field
-    body_parts.append(f"--{boundary}".encode())
-    body_parts.append(b'Content-Disposition: form-data; name="apikey"')
-    body_parts.append(b"")
-    body_parts.append(api_key.encode())
+    def add_field(name, value):
+        body_parts.append(("--" + boundary).encode())
+        body_parts.append(('Content-Disposition: form-data; name="' + name + '"').encode())
+        body_parts.append(b"")
+        body_parts.append(value if isinstance(value, bytes) else value.encode())
 
-    # -- language field (English)
-    body_parts.append(f"--{boundary}".encode())
-    body_parts.append(b'Content-Disposition: form-data; name="language"')
-    body_parts.append(b"")
-    body_parts.append(b"eng")
+    add_field("apikey", api_key)
+    add_field("language", "eng")
+    add_field("OCREngine", "2")
+    add_field("scale", "true")
+    # NOTE: isTable NOT used — it changes output format in ways that break parsing
+    # Plain text output is more reliable for our regex-based extraction
 
-    # -- OCREngine field (Engine 2 — better accuracy, auto language detection)
-    body_parts.append(f"--{boundary}".encode())
-    body_parts.append(b'Content-Disposition: form-data; name="OCREngine"')
-    body_parts.append(b"")
-    body_parts.append(b"2")
-
-    # -- isTable field — improves table recognition for product grids
-    body_parts.append(f"--{boundary}".encode())
-    body_parts.append(b'Content-Disposition: form-data; name="isTable"')
-    body_parts.append(b"")
-    body_parts.append(b"true")
-
-    # -- scale field — upscale small/low-res scans for better accuracy
-    body_parts.append(f"--{boundary}".encode())
-    body_parts.append(b'Content-Disposition: form-data; name="scale"')
-    body_parts.append(b"")
-    body_parts.append(b"true")
-
-    # -- file field — the PDF bytes
-    body_parts.append(f"--{boundary}".encode())
+    body_parts.append(("--" + boundary).encode())
     body_parts.append(b'Content-Disposition: form-data; name="file"; filename="page.pdf"')
     body_parts.append(b"Content-Type: application/pdf")
     body_parts.append(b"")
     body_parts.append(pdf_bytes)
+    body_parts.append(("--" + boundary + "--").encode())
 
-    # Closing boundary
-    body_parts.append(f"--{boundary}--".encode())
-
-    # Join with CRLF as required by multipart spec
     body = b"\r\n".join(body_parts)
 
     req = urllib.request.Request(
         "https://api.ocr.space/parse/image",
         data=body,
-        headers={
-            "Content-Type": f"multipart/form-data; boundary={boundary}",
-        },
+        headers={"Content-Type": "multipart/form-data; boundary=" + boundary},
         method="POST",
     )
 
     with urllib.request.urlopen(req, timeout=55) as resp:
         result = json.loads(resp.read().decode("utf-8"))
 
-    # OCR.space returns ParsedResults — extract plain text from each page result
     parsed = result.get("ParsedResults", [])
     if not parsed:
         error_msg = result.get("ErrorMessage", ["Unknown OCR error"])
         if isinstance(error_msg, list):
             error_msg = " ".join(error_msg)
-        raise ValueError(f"OCR.space error: {error_msg}")
+        raise ValueError("OCR.space error: " + error_msg)
 
-    # Join all parsed page text (will be 1 page since router pre-splits)
-    full_text = "\n".join(
-        p.get("ParsedText", "") for p in parsed
-    )
-    return full_text
+    return "\n".join(p.get("ParsedText", "") for p in parsed)
 
 
 def get_pdf_text(pdf_bytes):
-    """
-    Smart text extraction:
-    - Digital PDFs: pdfplumber reads the text layer directly (free, instant)
-    - Scanned PDFs: OCR.space API reads the image and returns plain text (free)
-    Since the Grove PDF Router pre-splits all PDFs into single pages before
-    calling this extractor, every PDF received here is always 1 page.
-    """
+    """Route to correct text extractor based on PDF type."""
     if is_scanned_pdf(pdf_bytes):
         return extract_text_with_ocrspace(pdf_bytes)
-    else:
-        return extract_text_with_pdfplumber(pdf_bytes)
+    return extract_text_with_pdfplumber(pdf_bytes)
 
 
-# ── Helpers ──────────────────────────────────────────────────────────────────
+# ── Helpers ───────────────────────────────────────────────────────────────────
 
 def clean(value):
-    """Strip whitespace and return empty string if None."""
+    """Strip whitespace and collapse internal spaces."""
     if value is None:
         return ""
     v = str(value).strip()
-    v = re.sub(r'\s+', ' ', v)   # collapse multiple spaces
+    v = re.sub(r'\s+', ' ', v)
     return v.strip()
 
 
-def find_value_after_label(lines, *labels):
+def find_by_regex(text, *patterns):
     """
-    Search through lines for a label and return the text that follows it.
-    Handles both same-line ("ETD: 15 Apr 2026") and next-line values.
-    Also handles markdown table format (| ETD | 15 Apr 2026 |).
+    Try each regex pattern in order, return first captured group found.
+    All patterns should have exactly one capture group for the value.
     """
-    for i, line in enumerate(lines):
-        line_stripped = clean(line)
-        line_upper = line_stripped.upper()
-        for label in labels:
-            label_upper = label.upper()
-            if label_upper in line_upper:
-                # Try same line: "ETD: 15 Apr 2026" or "ETD 15 Apr 2026"
-                after = re.split(re.escape(label), line_stripped, flags=re.IGNORECASE, maxsplit=1)
-                if len(after) > 1:
-                    value = clean(after[1].lstrip(":").lstrip("|").strip())
-                    # If value looks like another label, skip it
-                    if value and not any(lbl.upper() in value.upper() for lbl in ["REF", "INVOICE", "CUSTOMER", "ETD", "SHIP"]):
-                        return value
-                # Try next line
-                if i + 1 < len(lines):
-                    next_val = clean(lines[i + 1])
-                    if next_val and not next_val.startswith("|"):
-                        return next_val
+    for pattern in patterns:
+        m = re.search(pattern, text, re.IGNORECASE)
+        if m:
+            return clean(m.group(1))
     return ""
 
 
-def extract_block(lines, start_label, end_labels):
+# ── Header extraction ─────────────────────────────────────────────────────────
+
+def _extract_etd_ref(text):
     """
-    Extract lines starting after start_label, ending before any end_label.
-    Handles both plain text and markdown-formatted output from Mistral OCR.
+    Handle columnar header layout where labels are on one line and
+    values are on the next. OCR collapses multi-spaces so we use
+    regex on the values line rather than character positions.
+    Pattern: line with 2+ of [ETD, Ref, Invoice, Customer PO]
+             followed by a line starting with a date or code.
     """
-    block = []
-    in_block = False
-    for line in lines:
-        stripped = clean(line)
-        if not stripped:
-            continue
-        # Skip markdown table separator lines
-        if re.match(r'^[\|\-\s]+$', stripped):
-            continue
-        if start_label.upper() in stripped.upper():
-            in_block = True
-            # Check if value is on the same line after the label
-            after = re.split(re.escape(start_label), stripped, flags=re.IGNORECASE, maxsplit=1)
-            if len(after) > 1 and clean(after[1].lstrip(":")):
-                block.append(clean(after[1].lstrip(":")))
-            continue
-        if in_block:
-            if any(lbl.upper() in stripped.upper() for lbl in end_labels):
-                break
-            # Strip markdown pipe chars from table cells
-            stripped = stripped.strip("|").strip()
-            if stripped:
-                block.append(stripped)
-    return block
-
-
-def parse_address_block(block):
-    """
-    Parse address lines into structured fields.
-    Identifies UK postcode with regex, works backward from there.
-    """
-    UK_POSTCODE = re.compile(
-        r'\b([A-Z]{1,2}\d{1,2}[A-Z]?\s*\d[A-Z]{2})\b', re.IGNORECASE
-    )
-
-    street_lines = []
-    city = ""
-    region = ""
-    postcode = ""
-    country = ""
-
-    # Find the postcode line
-    postcode_idx = None
-    for i, line in enumerate(block):
-        m = UK_POSTCODE.search(line)
-        if m:
-            postcode = clean(m.group(1))
-            postcode_idx = i
-            break
-
-    if postcode_idx is not None:
-        pre = block[:postcode_idx]
-        post = block[postcode_idx + 1:]
-
-        if pre:
-            # Last pre-postcode line is city or "City, Region"
-            city_line = pre[-1]
-            if "," in city_line:
-                parts = city_line.split(",", 1)
-                city = clean(parts[0])
-                region = clean(parts[1])
-            else:
-                # Check if postcode line itself has "City Region" before the postcode
-                postcode_line = block[postcode_idx]
-                before_pc = UK_POSTCODE.split(postcode_line)[0].strip().rstrip(",").strip()
-                if before_pc:
-                    if "," in before_pc:
-                        parts = before_pc.split(",", 1)
-                        city = clean(parts[0])
-                        region = clean(parts[1])
-                    else:
-                        city = clean(before_pc)
-                else:
-                    city = clean(city_line)
-            street_lines = pre[:-1]
-        country = clean(post[0]) if post else "United Kingdom"
-    else:
-        # No postcode found — use last line as country guess
-        street_lines = block[:-1] if len(block) > 1 else block
-        country = clean(block[-1]) if len(block) > 1 else ""
-
-    return {
-        "street": ", ".join(street_lines),
-        "city": city,
-        "region": region,
-        "postcode": postcode,
-        "country": country,
-    }
-
-
-def extract_contact(lines):
-    """Extract phone and mobile numbers from lines."""
-    phone = ""
-    mobile = ""
-    for line in lines:
-        if re.search(r'phone|tel(?![\w])', line, re.IGNORECASE):
-            m = re.search(r'[\d][\d\s\-\+\(\)]{6,}', line)
-            if m:
-                phone = clean(m.group())
-        if re.search(r'mobile|mob(?![\w])', line, re.IGNORECASE):
-            m = re.search(r'[\d][\d\s\-\+\(\)]{6,}', line)
-            if m:
-                mobile = clean(m.group())
-    return phone, mobile
-
-
-def extract_product_table_from_text(lines):
-    """
-    Extract product selection from text lines when table extraction isn't available.
-    Looks for the Product Selection section and parses item/options/qty rows.
-    Works with both plain text and Mistral OCR markdown table output.
-    """
-    products = []
-    in_table = False
-    header_found = False
-
-    # Column indices from header
-    item_col = 0
-    opt_col = 1
-    qty_col = -1
-
-    for line in lines:
-        stripped = clean(line)
-        if not stripped:
-            continue
-
-        # Detect start of product section
-        if "product selection" in stripped.lower():
-            in_table = True
-            continue
-
-        if not in_table:
-            continue
-
-        # Detect end of product section
-        if any(kw in stripped.lower() for kw in ["balance owing", "authorisation", "authorization", "vat no", "total"]):
-            break
-
-        # Parse markdown table rows: | Item | Options | Qty |
-        if "|" in stripped:
-            cells = [c.strip() for c in stripped.split("|") if c.strip()]
-            if not cells:
-                continue
-
-            # Header row
-            if not header_found:
-                row_lower = " ".join(cells).lower()
-                if any(kw in row_lower for kw in ["item", "product", "qty", "options"]):
-                    header_found = True
-                    for i, h in enumerate(cells):
-                        h_lower = h.lower()
-                        if "item" in h_lower or "product" in h_lower or "desc" in h_lower:
-                            item_col = i
-                        elif "option" in h_lower or "colour" in h_lower or "size" in h_lower:
-                            opt_col = i
-                        elif "qty" in h_lower or "quantity" in h_lower:
-                            qty_col = i
-                    continue
-                # Separator row --- skip
-                if re.match(r'^[\-\s\|]+$', stripped):
-                    continue
-
-            # Data row
-            if header_found and len(cells) >= 2:
-                def safe(idx):
-                    if idx is None or idx < 0:
-                        return cells[idx] if idx == -1 and cells else ""
-                    return cells[idx] if idx < len(cells) else ""
-
-                item = safe(item_col)
-                options = safe(opt_col) if opt_col is not None else ""
-                qty = safe(qty_col)
-
-                # Skip separator rows (all dashes)
-                if re.match(r'^[-\s]+$', item) and re.match(r'^[-\s]+$', options or ""):
-                    continue
-                # Skip rows that look like sub-items (SKU lines like "15373/65000 (X1)")
-                if re.match(r'^\d{5}/\d{5}', item):
-                    continue
-
-                if item or qty:
-                    products.append({"item": item, "options": options, "qty": qty})
-
-        elif header_found:
-            # Plain text line after header — try simple split
-            # Skip SKU lines
-            if re.match(r'^\d{5}/\d{5}', stripped):
-                continue
-            parts = stripped.rsplit(None, 1)
-            if len(parts) == 2 and re.match(r'^\d+$', parts[1]):
-                products.append({"item": parts[0], "options": "", "qty": parts[1]})
-
-    return products
-
-
-def extract_product_table_pdfplumber(pdf_bytes):
-    """Use pdfplumber table extraction for digital PDFs."""
-    products = []
-    with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
-        for page in pdf.pages:
-            tables = page.extract_tables()
-            for table in tables:
-                if not table or len(table) < 2:
-                    continue
-                header_idx = None
-                for i, row in enumerate(table):
-                    row_text = " ".join(str(c or "").lower() for c in row)
-                    if any(kw in row_text for kw in ["item", "product", "qty", "options"]):
-                        header_idx = i
-                        break
-                if header_idx is None and len(table[0]) >= 3:
-                    header_idx = 0
-                if header_idx is None:
-                    continue
-                headers = [clean(str(h or "")).lower() for h in table[header_idx]]
-                item_col = next((i for i, h in enumerate(headers) if "item" in h or "product" in h), 0)
-                opt_col = next((i for i, h in enumerate(headers) if "option" in h or "colour" in h or "size" in h), 1 if len(headers) > 1 else None)
-                qty_col = next((i for i, h in enumerate(headers) if "qty" in h or "quantity" in h), len(headers) - 1)
-                for row in table[header_idx + 1:]:
-                    if not row or all(c is None or clean(str(c)) == "" for c in row):
-                        continue
-                    def safe_get(idx):
-                        if idx is None or idx >= len(row):
-                            return ""
-                        return clean(str(row[idx] or ""))
-                    item = safe_get(item_col)
-                    options = safe_get(opt_col) if opt_col is not None else ""
-                    qty = safe_get(qty_col)
-                    if item or qty:
-                        products.append({"item": item, "options": options, "qty": qty})
-                if products:
-                    return products
-    return products
-
-
-# ── Empty response templates ──────────────────────────────────────────────────
-
-def other_response():
-    return {"document_type": "other", "document": None}
-
-
-def empty_delivery_order():
-    return {
-        "document_type": "delivery_order",
-        "document": {
-            "header": {"title": "", "etd": "", "ref": "", "inv_no": "", "customer_po_no": ""},
-            "customer": {
-                "company_name": None,
-                "name": "",
-                "address": {"street": "", "city": "", "region": "", "postcode": "", "country": ""},
-                "phone": "",
-                "mobile": "",
-            },
-            "ship_to": {
-                "name": "",
-                "address": {"street": "", "city": "", "region": "", "postcode": "", "country": ""},
-            },
-            "handwritten": {},
-            "product_selection": [],
-        },
-    }
-
-
-def parse_header_fields(lines):
-    """
-    Parse ETD, Ref, Invoice Number, Customer PO No from delivery order header.
-    Handles three layouts Mistral OCR may produce:
-      A) Markdown table: | ETD | Ref | Invoice Number | ... |
-                         | 15 Apr 2026 | ABED19631-11 | ... |
-      B) Columnar text: labels on one line, values on next (character-position aligned)
-      C) Inline:        ETD: 15 Apr 2026 (each on its own line)
-    """
-    etd = ref = inv_no = customer_po_no = ""
-    header_keywords = ["etd", "ref", "invoice", "customer po"]
-
+    etd = ""
+    ref = ""
+    lines = text.split("\n")
+    label_kws = ["etd", "ref", "invoice", "customer po"]
     for i, line in enumerate(lines):
-        line_lower = line.lower()
+        ll = line.lower()
+        if sum(1 for kw in label_kws if kw in ll) >= 2:
+            # Find next non-empty line — that is the values line
+            for j in range(i + 1, min(i + 4, len(lines))):
+                vline = lines[j].strip()
+                if not vline:
+                    continue
+                # Values line should NOT be another header
+                if sum(1 for kw in label_kws if kw in vline.lower()) >= 2:
+                    continue
+                # Extract date (ETD)
+                dm = re.search(r'(\d{1,2}\s+[A-Za-z]{3,9}\s+\d{4})', vline)
+                if dm:
+                    etd = dm.group(1).strip()
+                    # Ref is whatever comes after the date
+                    after_date = vline[dm.end():].strip()
+                    rm = re.search(r'([A-Z]{2,}\d+[\w\-]*)', after_date)
+                    if rm:
+                        ref = rm.group(1)
+                # Try date as dd/mm/yyyy
+                if not etd:
+                    dm2 = re.search(r'(\d{1,2}[/-]\d{1,2}[/-]\d{2,4})', vline)
+                    if dm2:
+                        etd = dm2.group(1).strip()
+                        after = vline[dm2.end():].strip()
+                        rm2 = re.search(r'([A-Z]{2,}\d+[\w\-]*)', after)
+                        if rm2:
+                            ref = rm2.group(1)
+                break
+        if etd:
+            break
+    return etd, ref
 
-        # ── Layout A: Markdown table header row ─────────────────────────────
-        if "|" in line and any(kw in line_lower for kw in header_keywords):
-            headers = [c.strip().lower() for c in line.split("|") if c.strip()]
-            # Find values on next line
-            if i + 1 < len(lines) and "|" in lines[i + 1]:
-                next_line = lines[i + 1]
-                # Skip separator lines (|---|---|)
-                if re.match(r"^[\|\-\s]+$", next_line):
-                    if i + 2 < len(lines):
-                        next_line = lines[i + 2]
-                values = [c.strip() for c in next_line.split("|") if c.strip()]
-                for hi, header in enumerate(headers):
-                    val = values[hi] if hi < len(values) else ""
-                    if "etd" in header and not etd:
-                        etd = val
-                    elif header == "ref" and not ref:
-                        ref = val
-                    elif "invoice" in header and not inv_no:
-                        inv_no = val
-                    elif "customer po" in header and not customer_po_no:
-                        customer_po_no = val
-                if etd or ref:
-                    return etd, ref, inv_no, customer_po_no
 
-        # ── Layout B: Columnar text (2+ labels on same line) ────────────────
-        matches = sum(1 for kw in header_keywords if kw in line_lower)
-        if matches >= 2 and "|" not in line:
-            # Values are on the next non-header line
-            for j in range(i + 1, min(i + 3, len(lines))):
-                candidate = lines[j]
-                if not any(kw in candidate.lower() for kw in header_keywords):
-                    values_line = candidate
-                    # Use character positions from header line
-                    label_pos = []
-                    for kw in ["etd", "ref", "invoice number", "customer po no", "customer po"]:
-                        idx = line_lower.find(kw)
-                        if idx >= 0 and not any(abs(idx - p[0]) < 3 for p in label_pos):
-                            label_pos.append((idx, kw))
-                    label_pos.sort()
-                    for pi, (pos, lbl) in enumerate(label_pos):
-                        end_pos = label_pos[pi+1][0] if pi+1 < len(label_pos) else len(values_line)+50
-                        s = min(pos, len(values_line))
-                        e = min(end_pos, len(values_line))
-                        val = values_line[s:e].strip() if s < len(values_line) else ""
-                        if "etd" in lbl and not etd:
-                            etd = val
-                        elif lbl == "ref" and not ref:
-                            ref = val
-                        elif "invoice" in lbl and not inv_no:
-                            inv_no = val
-                        elif "customer po" in lbl and not customer_po_no:
-                            customer_po_no = val
-                    break
-            if etd or ref:
-                return etd, ref, inv_no, customer_po_no
-
-        # ── Layout C: Inline format ──────────────────────────────────────────
-        if not etd and "etd" in line_lower and ":" in line:
-            etd = find_value_after_label([line], "ETD")
-        if not ref and re.search(r"\bref\b", line_lower) and ":" in line:
-            ref = find_value_after_label([line], "Ref")
-        if not inv_no and "invoice" in line_lower and ":" in line:
-            inv_no = find_value_after_label([line], "Invoice Number", "Invoice No")
-        if not customer_po_no and "customer po" in line_lower and ":" in line:
-            customer_po_no = find_value_after_label([line], "Customer PO No", "Customer PO")
-
-    return etd, ref, inv_no, customer_po_no
-
-# ── Main extraction ───────────────────────────────────────────────────────────
-
-def extract_delivery_order(pdf_bytes):
+def extract_header(text):
     """
-    Extract structured data from a delivery order PDF.
-    Handles both digital and scanned PDFs transparently.
+    Extract header fields using regex patterns that work regardless of
+    column spacing, line breaks, or OCR spacing variations.
     """
-    scanned = is_scanned_pdf(pdf_bytes)
-    full_text = get_pdf_text(pdf_bytes)
 
-    # ── Gatekeeper ────────────────────────────────────────────────────────────
-    if "Delivery Order" not in full_text and "DELIVERY ORDER" not in full_text and "delivery order" not in full_text.lower():
-        return other_response()
-
-    # ── Parse lines ───────────────────────────────────────────────────────────
-    lines = [clean(l) for l in full_text.split("\n") if clean(l)]
-
-    # ── Header ────────────────────────────────────────────────────────────────
-    # Brand name: first meaningful non-header line (skip lines that are just "Delivery Order")
+    # Brand name: first non-empty line that isn't "Delivery Order"
     title = ""
-    for line in lines:
-        if "delivery order" in line.lower():
-            continue
-        if len(line) > 2:
-            title = line
+    for line in text.split("\n"):
+        stripped = clean(line)
+        if stripped and "delivery order" not in stripped.lower():
+            title = stripped
             break
 
-    # Header fields: detect the columnar header line then read values from next line
-    etd, ref, inv_no, customer_po_no = parse_header_fields(lines)
-
-    # ── Customer block ────────────────────────────────────────────────────────
-    customer_block = extract_block(
-        lines, "Customer:",
-        ["Ship To", "Deliver To", "Product Selection", "Handwritten"]
-    )
-    if not customer_block:
-        customer_block = extract_block(
-            lines, "Customer",
-            ["Ship To", "Deliver To", "Product Selection"]
+    # ETD + Ref: detect the header label row then parse values from next line
+    # OCR collapses column spacing, so we find the values line and parse it
+    etd, ref = _extract_etd_ref(text)
+    if not etd:
+        etd = find_by_regex(
+            text,
+            r'ETD[\s:]+(\d{1,2}\s+[A-Za-z]{3,9}\s+\d{4})',
+            r'ETD[\s:]+(\d{1,2}[/-]\d{1,2}[/-]\d{2,4})',
+        )
+    if not ref:
+        ref = find_by_regex(
+            text,
+            r'Ref[\s:]+([A-Z]{2,}\d+[\w\-]*)',
         )
 
-    company_name = clean(customer_block[0]) if customer_block else None
-    customer_name = clean(customer_block[1]) if len(customer_block) > 1 else ""
-
-    # Separate address lines from phone/mobile
-    address_lines = []
-    phone = ""
-    mobile = ""
-    for line in (customer_block[2:] if len(customer_block) > 2 else []):
-        if re.search(r'phone|tel(?!\w)|mobile|mob(?!\w)', line, re.IGNORECASE):
-            p, m = extract_contact([line])
-            if p:
-                phone = p
-            if m:
-                mobile = m
-        else:
-            address_lines.append(line)
-
-    # Also scan all lines for phone/mobile if not found in block
-    if not phone and not mobile:
-        phone, mobile = extract_contact(lines)
-
-    customer_address = parse_address_block(address_lines) if address_lines else {
-        "street": "", "city": "", "region": "", "postcode": "", "country": ""
-    }
-
-    # ── Ship To block ─────────────────────────────────────────────────────────
-    ship_block = extract_block(
-        lines, "Ship To:",
-        ["Product Selection", "Handwritten", "Balance", "Authorisation"]
+    # Invoice Number — must contain at least one digit to avoid matching label words
+    inv_no = find_by_regex(
+        text,
+        r'Invoice\s+(?:Number|No)[\s:]+((?=[A-Z0-9\-/]*\d)[A-Z0-9\-/]+)',
+        r'Inv(?:oice)?[\s.#:]+((?=[A-Z0-9\-/]*\d)[A-Z0-9\-/]+)',
     )
-    if not ship_block:
-        ship_block = extract_block(
-            lines, "Ship To",
-            ["Product Selection", "Handwritten", "Balance"]
-        )
 
-    ship_name = clean(ship_block[0]) if ship_block else ""
-    ship_address_lines = ship_block[1:] if len(ship_block) > 1 else []
-    ship_address = parse_address_block(ship_address_lines) if ship_address_lines else {
-        "street": "", "city": "", "region": "", "postcode": "", "country": ""
-    }
+    # Customer PO Number — must contain at least one digit
+    customer_po_no = find_by_regex(
+        text,
+        r'Customer\s+PO\s+No[\s:]+((?=[A-Z0-9\-/]*\d)[A-Z0-9\-/]+)',
+        r'Customer\s+PO[\s:]+((?=[A-Z0-9\-/]*\d)[A-Z0-9\-/]+)',
+        r'PO\s+No[\s:]+((?=[A-Z0-9\-/]*\d)[A-Z0-9\-/]+)',
+        r'Purchase\s+Order[\s:]+((?=[A-Z0-9\-/]*\d)[A-Z0-9\-/]+)',
+    )
 
-    # ── Product Selection ─────────────────────────────────────────────────────
-    if scanned:
-        # Use text-based table parser for Mistral OCR markdown output
-        products = extract_product_table_from_text(lines)
-    else:
-        # Use pdfplumber's structural table extraction for digital PDFs
-        products = extract_product_table_pdfplumber(pdf_bytes)
-        if not products:
-            products = extract_product_table_from_text(lines)
-
-    # ── Assemble response ─────────────────────────────────────────────────────
-    result = empty_delivery_order()
-    result["document"]["header"] = {
+    return {
         "title": title,
         "etd": etd,
         "ref": ref,
         "inv_no": inv_no,
         "customer_po_no": customer_po_no,
     }
-    result["document"]["customer"] = {
-        "company_name": company_name,
-        "name": customer_name,
-        "address": customer_address,
-        "phone": phone,
-        "mobile": mobile,
-    }
-    result["document"]["ship_to"] = {
-        "name": ship_name,
-        "address": ship_address,
-    }
-    result["document"]["product_selection"] = products
-    result["document"]["handwritten"] = {}
 
-    return result
+
+# ── Address extraction ────────────────────────────────────────────────────────
+
+UK_POSTCODE_RE = re.compile(
+    r'\b([A-Z]{1,2}\d{1,2}[A-Z]?\s*\d[A-Z]{2})\b', re.IGNORECASE
+)
+
+
+def parse_address_lines(lines):
+    """
+    Parse a list of address lines into structured fields.
+    Finds UK postcode by regex and works outward from it.
+    """
+    # Filter out phone/mobile/empty lines
+    addr_lines = []
+    phone = ""
+    mobile = ""
+    for line in lines:
+        l = clean(line)
+        if not l:
+            continue
+        if re.search(r'\bphone\b|\btel\b', l, re.IGNORECASE):
+            m = re.search(r'[\d][\d\s\-\+\(\)]{6,}', l)
+            if m:
+                phone = clean(m.group())
+            continue
+        if re.search(r'\bmobile\b|\bmob\b', l, re.IGNORECASE):
+            m = re.search(r'[\d][\d\s\-\+\(\)]{6,}', l)
+            if m:
+                mobile = clean(m.group())
+            continue
+        addr_lines.append(l)
+
+    postcode = ""
+    postcode_idx = None
+    for i, line in enumerate(addr_lines):
+        m = UK_POSTCODE_RE.search(line)
+        if m:
+            postcode = clean(m.group(1))
+            postcode_idx = i
+            break
+
+    street = ""
+    city = ""
+    region = ""
+    country = "United Kingdom"
+
+    if postcode_idx is not None:
+        pre = addr_lines[:postcode_idx]
+        post = addr_lines[postcode_idx + 1:]
+
+        # Last pre-postcode line is "City, Region" or just "City"
+        if pre:
+            # Check if postcode is on the same line as city/region
+            pc_line = addr_lines[postcode_idx]
+            before_pc = UK_POSTCODE_RE.split(pc_line)[0].strip().rstrip(",").strip()
+            if before_pc:
+                # "Abingdon, Oxfordshire" or "Abingdon"
+                if "," in before_pc:
+                    parts = before_pc.split(",", 1)
+                    city = clean(parts[0])
+                    region = clean(parts[1])
+                else:
+                    city = clean(before_pc)
+                street = ", ".join(pre)
+            else:
+                city_line = pre[-1]
+                if "," in city_line:
+                    parts = city_line.split(",", 1)
+                    city = clean(parts[0])
+                    region = clean(parts[1])
+                else:
+                    city = clean(city_line)
+                street = ", ".join(pre[:-1])
+        country = clean(post[0]) if post else "United Kingdom"
+    else:
+        street = ", ".join(addr_lines[:-1]) if len(addr_lines) > 1 else (addr_lines[0] if addr_lines else "")
+        country = addr_lines[-1] if len(addr_lines) > 1 else ""
+
+    return {
+        "street": street,
+        "city": city,
+        "region": region,
+        "postcode": postcode,
+        "country": country,
+    }, phone, mobile
+
+
+def extract_section(text, start_pattern, end_pattern):
+    """
+    Extract lines between start_pattern and end_pattern using regex boundaries.
+    Returns list of non-empty lines.
+    """
+    m_start = re.search(start_pattern, text, re.IGNORECASE)
+    if not m_start:
+        return []
+
+    after_start = text[m_start.end():]
+
+    m_end = re.search(end_pattern, after_start, re.IGNORECASE)
+    section_text = after_start[:m_end.start()] if m_end else after_start
+
+    lines = [clean(l) for l in section_text.split("\n") if clean(l)]
+    return lines
+
+
+# ── Customer and Ship To extraction ──────────────────────────────────────────
+
+def extract_customer(text):
+    """
+    Extract customer details.
+    Handles two-column OCR layouts where Customer and Ship To appear
+    side-by-side on the same lines.
+    """
+    # Find the section between "Customer:" and "Ship To:" or "Product Selection"
+    lines = extract_section(
+        text,
+        r'Customer\s*:',
+        r'Ship\s+To\s*:|Product\s+Selection|Handwritten'
+    )
+
+    if not lines:
+        return None, "", {"street": "", "city": "", "region": "", "postcode": "", "country": ""}, "", ""
+
+    # If OCR merged Customer and Ship To columns, lines may contain both
+    # e.g. "Abingdon Beds Ltd Abingdon Beds Ltd" — clean by taking first half
+    cleaned = []
+    for line in lines:
+        # Detect duplicated content (OCR reads two-column layout left-to-right)
+        words = line.split()
+        half = len(words) // 2
+        if half > 1 and words[:half] == words[half:]:
+            # Line is exactly duplicated — take first half only
+            line = " ".join(words[:half])
+        cleaned.append(clean(line))
+
+    company_name = cleaned[0] if cleaned else None
+    name = cleaned[1] if len(cleaned) > 1 else ""
+    addr_lines = cleaned[2:] if len(cleaned) > 2 else []
+
+    address, phone, mobile = parse_address_lines(addr_lines)
+
+    # If phone not found in block, search full text
+    if not phone:
+        m = re.search(r'Phone[\s:]+(\d[\d\s\-\+\(\)]{6,})', text, re.IGNORECASE)
+        if m:
+            phone = clean(m.group(1))
+    if not mobile:
+        m = re.search(r'Mobile[\s:]+(\d[\d\s\-\+\(\)]{6,})', text, re.IGNORECASE)
+        if m:
+            mobile = clean(m.group(1))
+
+    return company_name, name, address, phone, mobile
+
+
+def extract_ship_to(text):
+    """
+    Extract Ship To details.
+    Handles two-column OCR where Ship To appears to the right of Customer.
+    """
+    lines = extract_section(
+        text,
+        r'Ship\s+To\s*:',
+        r'Product\s+Selection|Handwritten|Balance\s+owing|Authorisation'
+    )
+
+    if not lines:
+        return "", {"street": "", "city": "", "region": "", "postcode": "", "country": ""}
+
+    # Remove duplicated column content same as customer
+    cleaned = []
+    for line in lines:
+        words = line.split()
+        half = len(words) // 2
+        if half > 1 and words[:half] == words[half:]:
+            line = " ".join(words[:half])
+        cleaned.append(clean(line))
+
+    name = cleaned[0] if cleaned else ""
+    addr_lines = cleaned[1:] if len(cleaned) > 1 else []
+    address, _, _ = parse_address_lines(addr_lines)
+
+    return name, address
+
+
+# ── Product extraction ────────────────────────────────────────────────────────
+
+SKU_RE = re.compile(r'^\d{5}/\d{5}', re.IGNORECASE)
+SECTION_END_RE = re.compile(
+    r'Balance\s+owing|Authorisation|Authorization|VAT\s+NO|Total\b',
+    re.IGNORECASE
+)
+PRODUCT_HEADER_RE = re.compile(r'\bItem\b|\bOptions\b|\bQty\b', re.IGNORECASE)
+
+
+def extract_products(text):
+    """
+    Extract product rows from the Product Selection section.
+    Handles plain text table output from OCR.space (no isTable flag).
+
+    Each product row looks like:
+      "Ocean Dream                    Mattress Size: 5'0 King              1"
+    Followed by optional SKU lines:
+      "15373/65000 (X1)"
+
+    Strategy: find "Product Selection", read lines until end marker,
+    skip header and SKU lines, parse each data row by splitting off
+    the trailing integer (qty) and detecting the options separator.
+    """
+    lines = extract_section(
+        text,
+        r'Product\s+Selection',
+        r'Balance\s+owing|Authorisation|Authorization|VAT\s+NO'
+    )
+
+    products = []
+    for line in lines:
+        if not line:
+            continue
+        # Skip the column header row
+        if PRODUCT_HEADER_RE.search(line) and len(line.split()) <= 6:
+            continue
+        # Skip SKU lines like "15373/65000 (X1)"
+        if SKU_RE.match(line):
+            continue
+        # Skip separator lines
+        if re.match(r'^[\-\s\.]+$', line):
+            continue
+
+        # Try to split into item / options / qty
+        # Qty is always a trailing integer (1, 2, 3...)
+        qty_match = re.search(r'\s+(\d+)\s*$', line)
+        if not qty_match:
+            continue
+
+        qty = qty_match.group(1)
+        remainder = line[:qty_match.start()].strip()
+
+        # Options typically start with "Mattress Size:" or similar keyword
+        # Split on the first occurrence of a known options pattern
+        # First try keyword-based split (works even when OCR collapses spaces)
+        options_match = re.search(
+            r'(Mattress\s+Size[:\s]|Colour[:\s]|Color[:\s]|Size[:\s]|Type[:\s]|Option[:\s])',
+            remainder, re.IGNORECASE
+        )
+        if options_match:
+            item = remainder[:options_match.start()].strip()
+            options = remainder[options_match.start():].strip()
+        else:
+            # Fallback: split on 2+ spaces
+            parts = re.split(r'\s{2,}', remainder, maxsplit=1)
+            item = parts[0].strip()
+            options = parts[1].strip() if len(parts) > 1 else ""
+
+        if item:
+            products.append({
+                "item": item,
+                "options": options,
+                "qty": qty,
+            })
+
+    return products
+
+
+# ── Response templates ────────────────────────────────────────────────────────
+
+def other_response():
+    return {"document_type": "other", "document": None}
+
+
+def build_response(header, company_name, cust_name, cust_addr, phone, mobile,
+                   ship_name, ship_addr, products):
+    return {
+        "document_type": "delivery_order",
+        "document": {
+            "header": header,
+            "customer": {
+                "company_name": company_name,
+                "name": cust_name,
+                "address": cust_addr,
+                "phone": phone,
+                "mobile": mobile,
+            },
+            "ship_to": {
+                "name": ship_name,
+                "address": ship_addr,
+            },
+            "handwritten": {},
+            "product_selection": products,
+        },
+    }
+
+
+# ── Main extraction ───────────────────────────────────────────────────────────
+
+def extract_delivery_order(pdf_bytes):
+    full_text = get_pdf_text(pdf_bytes)
+
+    # Gatekeeper
+    if "delivery order" not in full_text.lower():
+        return other_response()
+
+    header = extract_header(full_text)
+    company_name, cust_name, cust_addr, phone, mobile = extract_customer(full_text)
+    ship_name, ship_addr = extract_ship_to(full_text)
+    products = extract_products(full_text)
+
+    return build_response(
+        header, company_name, cust_name, cust_addr, phone, mobile,
+        ship_name, ship_addr, products
+    )
 
 
 # ── HTTP Handler ──────────────────────────────────────────────────────────────
@@ -710,7 +598,7 @@ class handler(BaseHTTPRequestHandler):
         self._send_json(200, {
             "status": "ok",
             "service": "Grove PDF Extractor",
-            "note": "POST a PDF as multipart/form-data (field: 'file'). Set OCR_SPACE_API_KEY env var on Vercel.",
+            "note": "POST a PDF as multipart/form-data (field: 'file'). Set OCR_SPACE_API_KEY on Vercel.",
         })
 
     def _send_json(self, status_code, data):
@@ -724,4 +612,3 @@ class handler(BaseHTTPRequestHandler):
 
     def log_message(self, format, *args):
         pass
-# This line intentionally left blank — patches applied below via sed
