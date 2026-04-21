@@ -1,14 +1,9 @@
 {
   "version": 2,
-  "functions": {
-    "api/handler.py": {
-      "maxDuration": 60
-    }
-  },
   "routes": [
     {
       "src": "/(.*)",
-      "dest": "/api/handler.py"
+      "dest": "/api/index.py"
     }
   ]
 }
