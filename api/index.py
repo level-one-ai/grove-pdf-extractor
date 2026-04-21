@@ -190,13 +190,17 @@ def extract_header(text):
     column spacing, line breaks, or OCR spacing variations.
     """
 
-    # Brand name: first non-empty line that isn't "Delivery Order"
+    # Brand name: text before "ETD" or "Delivery Order" label
     title = ""
-    for line in text.split("\n"):
-        stripped = clean(line)
-        if stripped and "delivery order" not in stripped.lower():
-            title = stripped
-            break
+    title_m = re.match(r'^(.+?)(?=\bETD\b|\bDelivery\s+Order\b)', text.strip(), re.IGNORECASE)
+    if title_m:
+        title = clean(title_m.group(1))
+    else:
+        for line in text.split("\n"):
+            stripped = clean(line)
+            if stripped and "delivery order" not in stripped.lower():
+                title = stripped
+                break
 
     # ETD + Ref: detect the header label row then parse values from next line
     # OCR collapses column spacing, so we find the values line and parse it
@@ -343,258 +347,344 @@ def extract_section(text, start_pattern, end_pattern):
     return lines
 
 
-# ── Customer and Ship To extraction ──────────────────────────────────────────
+# ── Customer and Ship To extraction ─────────────────────────────────────────
+
+STREET_TYPES_RE = re.compile(
+    r'\b(?:Road|Street|Avenue|Lane|Way|Close|Drive|Court|Place|Terrace|'
+    r'Gardens|Grove|Hill|Rise|Walk|Mews|Crescent|Square|Parade|Boulevard|'
+    r'Row|Circus|Wharf|Quay|Yard|Gate|View|Park|Estate)\b',
+    re.IGNORECASE
+)
+UK_POSTCODE_RE = re.compile(r'\b([A-Z]{1,2}\d{1,2}[A-Z]?\s*\d[A-Z]{2})\b', re.IGNORECASE)
+
+
+def _parse_flat_address(text):
+    """
+    Parse a flat single-line address string (as returned by OCR.space when it
+    reads a page as one continuous block without line breaks) into structured fields.
+
+    Expected pattern: "[Company] [Person Name] [Street Lines] [City], [Region] [PostCode]"
+    """
+    empty = {"street": "", "city": "", "region": "", "postcode": "", "country": "United Kingdom"}
+    result = dict(empty)
+    company = ""
+    name = ""
+
+    pc_m = UK_POSTCODE_RE.search(text)
+    if not pc_m:
+        return company, name, result
+
+    result["postcode"] = pc_m.group(1).strip()
+    before_pc = text[:pc_m.start()].strip().rstrip(",")
+
+    # Region: text after last comma (before postcode)
+    if "," in before_pc:
+        comma_idx = before_pc.rfind(",")
+        result["region"] = before_pc[comma_idx + 1:].strip()
+        before_region = before_pc[:comma_idx].strip()
+    else:
+        before_region = before_pc
+
+    # City: text after last street type word
+    street_matches = list(STREET_TYPES_RE.finditer(before_region))
+    if street_matches:
+        last_st = street_matches[-1]
+        result["city"] = before_region[last_st.end():].strip()
+        before_city = before_region[:last_st.end()].strip()
+    else:
+        words = before_region.rsplit(None, 1)
+        result["city"] = words[-1] if len(words) > 1 else ""
+        before_city = words[0] if len(words) > 1 else before_region
+
+    # Company: text up to "Ltd / Limited / PLC / LLP"
+    company_m = re.search(r'\b(Ltd|Limited|PLC|LLP|Inc|Group)\b', before_city, re.IGNORECASE)
+    if company_m:
+        company = before_city[:company_m.end()].strip()
+        after_company = before_city[company_m.end():].strip()
+    else:
+        after_company = before_city
+
+    # Person name: first two consecutive Title Case words
+    name_m = re.match(r'([A-Z][a-z]+\s+[A-Z][a-z]+)(?=\s|$)', after_company)
+    if name_m:
+        name = name_m.group(1)
+        result["street"] = after_company[name_m.end():].strip()
+    else:
+        result["street"] = after_company
+
+    return company, name, result
+
 
 def extract_customer(text):
     """
-    Extract customer details.
-    Handles two-column OCR layouts where Customer and Ship To appear
-    side-by-side on the same lines.
+    Extract customer block. Works with both:
+    - Multi-line OCR: uses section extraction + line parsing
+    - Flat single-line OCR: uses regex boundaries + flat address parser
     """
-    # Find the section between "Customer:" and "Ship To:" or "Product Selection"
-    lines = extract_section(
-        text,
-        r'Customer\s*:',
-        r'Ship\s+To\s*:|Product\s+Selection|Handwritten'
-    )
+    # Locate customer block
+    cust_m = re.search(r'Customer\s*:', text, re.IGNORECASE)
+    if not cust_m:
+        empty_addr = {"street": "", "city": "", "region": "", "postcode": "", "country": "United Kingdom"}
+        return None, "", empty_addr, "", ""
 
-    if not lines:
-        return None, "", {"street": "", "city": "", "region": "", "postcode": "", "country": ""}, "", ""
+    # Find end of customer block (stop before Phone:, Product Selection, or Ship To:)
+    cust_end_m = re.search(r'Phone:|Mobile:|Product\s+Selection|Ship\s+To:', text[cust_m.end():], re.IGNORECASE)
+    cust_block = text[cust_m.end(): cust_m.end() + cust_end_m.start()].strip() if cust_end_m else text[cust_m.end():].strip()
 
-    # If OCR merged Customer and Ship To columns, lines may contain both
-    # e.g. "Abingdon Beds Ltd Abingdon Beds Ltd" — clean by taking first half
-    cleaned = []
-    for line in lines:
-        # Detect duplicated content (OCR reads two-column layout left-to-right)
-        words = line.split()
-        half = len(words) // 2
-        if half > 1 and words[:half] == words[half:]:
-            # Line is exactly duplicated — take first half only
-            line = " ".join(words[:half])
-        cleaned.append(clean(line))
+    # Phone / mobile from full text
+    phone = ""
+    mobile = ""
+    ph_m = re.search(r'Phone\s*:\s*([\d][\d\s\-\+\(\)]{5,})', text, re.IGNORECASE)
+    mob_m = re.search(r'Mobile\s*:\s*([\d][\d\s\-\+\(\)]{5,})', text, re.IGNORECASE)
+    if ph_m:
+        phone = ph_m.group(1).strip()
+    if mob_m:
+        mobile = mob_m.group(1).strip()
 
-    company_name = cleaned[0] if cleaned else None
-    name = cleaned[1] if len(cleaned) > 1 else ""
-    addr_lines = cleaned[2:] if len(cleaned) > 2 else []
+    # Check if block has newlines (multi-line OCR) or is flat
+    lines = [l.strip() for l in cust_block.split('\n') if l.strip()]
 
-    address, phone, mobile = parse_address_lines(addr_lines)
-
-    # If phone not found in block, search full text
-    if not phone:
-        m = re.search(r'Phone[\s:]+(\d[\d\s\-\+\(\)]{6,})', text, re.IGNORECASE)
-        if m:
-            phone = clean(m.group(1))
-    if not mobile:
-        m = re.search(r'Mobile[\s:]+(\d[\d\s\-\+\(\)]{6,})', text, re.IGNORECASE)
-        if m:
-            mobile = clean(m.group(1))
-
-    return company_name, name, address, phone, mobile
+    if len(lines) >= 3:
+        # Multi-line: parse line by line
+        company_name = lines[0]
+        cust_name = lines[1] if len(lines) > 1 else ""
+        addr_lines = [l for l in lines[2:] if not re.search(r'Phone|Mobile', l, re.IGNORECASE)]
+        addr, p, m = parse_address_lines(addr_lines)
+        if p: phone = p
+        if m: mobile = m
+        return company_name, cust_name, addr, phone, mobile
+    else:
+        # Flat single-line: use address parser
+        company_name, cust_name, addr = _parse_flat_address(cust_block)
+        return company_name or None, cust_name, addr, phone, mobile
 
 
 def extract_ship_to(text):
     """
-    Extract Ship To details.
-    Handles two-column OCR where Ship To appears to the right of Customer.
+    Extract Ship To block. Works with both multi-line and flat single-line OCR.
     """
-    lines = extract_section(
-        text,
-        r'Ship\s+To\s*:',
-        r'Product\s+Selection|Handwritten|Balance\s+owing|Authorisation'
+    ship_m = re.search(r'Ship\s+To\s*:', text, re.IGNORECASE)
+    if not ship_m:
+        empty_addr = {"street": "", "city": "", "region": "", "postcode": "", "country": "United Kingdom"}
+        return "", empty_addr
+
+    # Find end of ship_to block
+    ship_end_m = re.search(
+        r'Options\b|Product\s+Selection|Balance\s+owing|Handwritten|Authoris',
+        text[ship_m.end():], re.IGNORECASE
     )
+    ship_block = text[ship_m.end(): ship_m.end() + ship_end_m.start()].strip() if ship_end_m else text[ship_m.end():].strip()
 
-    if not lines:
-        return "", {"street": "", "city": "", "region": "", "postcode": "", "country": ""}
+    lines = [l.strip() for l in ship_block.split('\n') if l.strip()]
 
-    # Remove duplicated column content same as customer
-    cleaned = []
+    if len(lines) >= 3:
+        name = lines[0]
+        addr, _, _ = parse_address_lines(lines[1:])
+        return name, addr
+    else:
+        company, person, addr = _parse_flat_address(ship_block)
+        # For ship_to, the "name" field should be the company name (delivery destination)
+        # Fall back to person name if no company found
+        ship_name = company or person or (ship_block.split()[0] if ship_block else "")
+        return ship_name, addr
+
+
+def parse_address_lines(lines):
+    """Parse a list of address lines into structured fields."""
+    phone = ""
+    mobile = ""
+    addr_lines = []
+
     for line in lines:
-        words = line.split()
-        half = len(words) // 2
-        if half > 1 and words[:half] == words[half:]:
-            line = " ".join(words[:half])
-        cleaned.append(clean(line))
+        l = line.strip()
+        if not l:
+            continue
+        if re.search(r'\bphone\b|\btel\b', l, re.IGNORECASE):
+            m = re.search(r'[\d][\d\s\-\+\(\)]{6,}', l)
+            if m:
+                phone = m.group().strip()
+            continue
+        if re.search(r'\bmobile\b|\bmob\b', l, re.IGNORECASE):
+            m = re.search(r'[\d][\d\s\-\+\(\)]{6,}', l)
+            if m:
+                mobile = m.group().strip()
+            continue
+        addr_lines.append(l)
 
-    name = cleaned[0] if cleaned else ""
-    addr_lines = cleaned[1:] if len(cleaned) > 1 else []
-    address, _, _ = parse_address_lines(addr_lines)
+    postcode = ""
+    postcode_idx = None
+    for i, line in enumerate(addr_lines):
+        m = UK_POSTCODE_RE.search(line)
+        if m:
+            postcode = m.group(1).strip()
+            postcode_idx = i
+            break
 
-    return name, address
+    street = ""
+    city = ""
+    region = ""
+    country = "United Kingdom"
+
+    if postcode_idx is not None:
+        pre = addr_lines[:postcode_idx]
+        post = addr_lines[postcode_idx + 1:]
+        pc_line = addr_lines[postcode_idx]
+        before_pc = UK_POSTCODE_RE.split(pc_line)[0].strip().rstrip(",").strip()
+        if before_pc:
+            if "," in before_pc:
+                parts = before_pc.split(",", 1)
+                city = parts[0].strip()
+                region = parts[1].strip()
+            else:
+                city = before_pc
+            street = ", ".join(pre)
+        elif pre:
+            city_line = pre[-1]
+            if "," in city_line:
+                parts = city_line.split(",", 1)
+                city = parts[0].strip()
+                region = parts[1].strip()
+            else:
+                city = city_line
+            street = ", ".join(pre[:-1])
+        country = post[0] if post else "United Kingdom"
+
+    return {"street": street, "city": city, "region": region, "postcode": postcode, "country": country}, phone, mobile
 
 
 # ── Product extraction ────────────────────────────────────────────────────────
 
-SKU_RE = re.compile(r'^\d{5}/\d{5}', re.IGNORECASE)
+SKU_RE = re.compile(r'\b\d{5}/\d{5}', re.IGNORECASE)
 PRODUCT_HEADER_RE = re.compile(r'\bItem\b|\bOptions\b|\bQty\b', re.IGNORECASE)
-OPTIONS_RE = re.compile(
-    r'(Mattress\s+Size|Colour|Color|Size|Type|Option|Variant|Style|Grade|Spec)',
+OPT_KW_RE = re.compile(
+    r'(?:Mattress|Colour|Color|Divan|Headboard|Ottoman|Fabric|Leather)',
     re.IGNORECASE
 )
 
 
-def _is_options_line(line):
-    return bool(OPTIONS_RE.search(line))
+def extract_products(text):
+    """
+    Extract product rows from a column-strip OCR layout.
 
+    OCR.space reads multi-column tables as vertical strips:
+      Strip 1: Item names + SKU codes  (between 'Item' and 'Ship To:' or 'Options')
+      Strip 2: Options                 (between 'Options' and 'Qty')
+      Strip 3: Qty integers + sometimes last option  (after 'Qty')
 
-def _is_qty_only(line):
-    return bool(re.match(r'^\d+$', line.strip()))
+    Strategy:
+      1. Locate each strip by its label keyword
+      2. Parse item names by splitting on SKU codes as delimiters
+      3. Parse options by splitting on option keyword re-occurrences
+      4. Parse qtys as leading integers, last option may be appended at end
+      5. Zip all three lists into product dicts
+    """
+    # Locate product section
+    ps_m = re.search(r'Product\s+Selection', text, re.IGNORECASE)
+    end_m = re.search(r'Balance\s+owing|Authorisation|Authorization|VAT\s+NO', text, re.IGNORECASE)
+    if not ps_m:
+        return []
 
+    ps_text = text[ps_m.end(): end_m.start() if end_m else len(text)]
 
-def _is_item_name(line):
-    if _is_qty_only(line):
-        return False
-    if SKU_RE.match(line):
-        return False
-    if _is_options_line(line):
-        return False
-    if re.match(r'[A-Z][a-z]', line):
-        return True
-    return False
+    item_m    = re.search(r'\bItem\b',    ps_text, re.IGNORECASE)
+    options_m = re.search(r'\bOptions\b', ps_text, re.IGNORECASE)
+    qty_m     = re.search(r'\bQty\b',     ps_text, re.IGNORECASE)
+    ship_m    = re.search(r'Ship\s+To:',  ps_text, re.IGNORECASE)
 
+    # If any marker is missing, fall back to line-based parsing
+    if not (item_m and options_m and qty_m):
+        return _parse_line_based(ps_text)
 
-def _extract_qty_from_line(line):
-    """Return (remainder, qty_str) or (line, None) if no trailing integer."""
-    m = re.search(r'\s+(\d+)\s*$', line)
-    if m:
-        return line[:m.start()].strip(), m.group(1)
-    if re.match(r'^\d+$', line.strip()):
-        return "", line.strip()
-    return line, None
+    # Items strip: from 'Item' to 'Ship To:' or 'Options' (whichever is earlier)
+    items_end_candidates = [m.start() for m in [ship_m, options_m] if m]
+    items_end = min(items_end_candidates) if items_end_candidates else options_m.start()
+    items_text = ps_text[item_m.end():items_end].strip()
 
+    # Options strip: from 'Options' to 'Qty'
+    options_text = ps_text[options_m.end():qty_m.start()].strip()
 
-def _parse_single_line(lines):
-    """Parse products where item+options+qty are all on one line."""
+    # Qty strip: from 'Qty' to end
+    qty_text = ps_text[qty_m.end():].strip()
+
+    # ── 1. Parse item names ───────────────────────────────────────────────
+    # Split on SKU codes (d{5}/d{5} with optional trailing "(X1)" etc)
+    # keeping only text that starts with a capital letter (real item names)
+    parts = re.split(r'\s*\d{5}/\d{5}\s*(?:\([^)]*\))?\s*', items_text)
+    item_names = [p.strip() for p in parts if p.strip() and re.match(r'[A-Z]', p.strip())]
+
+    if not item_names:
+        return _parse_line_based(ps_text)
+
+    # ── 2. Parse options ──────────────────────────────────────────────────
+    # Split on each re-occurrence of the option keyword
+    options_list = [
+        o.strip()
+        for o in re.split(r'(?=\b(?:' + OPT_KW_RE.pattern + r')\b)', options_text, flags=re.IGNORECASE)
+        if o.strip()
+    ]
+
+    # ── 3. Parse qty section ──────────────────────────────────────────────
+    # Leading integers are qtys; any remaining text is the last option
+    leading_m = re.match(r'^([\d\s]+)', qty_text)
+    qty_list = re.findall(r'\d+', leading_m.group(1)) if leading_m else []
+    remainder = qty_text[leading_m.end():].strip() if leading_m else qty_text
+
+    if remainder and re.search(r'[A-Za-z]{3,}', remainder):
+        # Trailing option in qty section — belongs to the last item
+        last_qty_m = re.search(r'\s+(\d+)\s*$', remainder)
+        if last_qty_m:
+            options_list.append(remainder[:last_qty_m.start()].strip())
+            qty_list.append(last_qty_m.group(1))
+        else:
+            # Qty was cut off by OCR — default to "1"
+            options_list.append(remainder.strip())
+            qty_list.append('1')
+
+    # ── 4. Zip into products ──────────────────────────────────────────────
     products = []
-    for line in lines:
-        remainder, qty = _extract_qty_from_line(line)
-        if qty is None:
+    for i, name in enumerate(item_names):
+        products.append({
+            'item': name,
+            'options': options_list[i] if i < len(options_list) else '',
+            'qty': qty_list[i] if i < len(qty_list) else '',
+        })
+
+    return products
+
+
+def _parse_line_based(text):
+    """
+    Fallback line-based parser for PDFs where OCR preserves row structure
+    (digital PDFs or high-resolution scans read row-by-row).
+    """
+    lines = [l.strip() for l in text.replace('\r', '').split('\n') if l.strip()]
+    clean_lines = [
+        l for l in lines
+        if not (PRODUCT_HEADER_RE.search(l) and len(l.split()) <= 6)
+        and not SKU_RE.match(l)
+        and not re.match(r'^[\-\s\.]+$', l)
+    ]
+
+    # Single-line: item + options + qty all on one line
+    products = []
+    for line in clean_lines:
+        qty_m = re.search(r'\s+(\d+)\s*$', line)
+        if not qty_m:
             continue
-        opts_m = OPTIONS_RE.search(remainder)
+        qty = qty_m.group(1)
+        remainder = line[:qty_m.start()].strip()
+        opts_m = OPT_KW_RE.search(remainder)
         if opts_m:
             item = remainder[:opts_m.start()].strip()
             options = remainder[opts_m.start():].strip()
         else:
             parts = re.split(r'\s{2,}', remainder, maxsplit=1)
             item = parts[0].strip()
-            options = parts[1].strip() if len(parts) > 1 else ""
-        if item:
-            products.append({"item": item, "options": options, "qty": qty})
+            options = parts[1].strip() if len(parts) > 1 else ''
+        if item and not SKU_RE.match(item):
+            products.append({'item': item, 'options': options, 'qty': qty})
+
     return products
-
-
-def _parse_multiline(lines):
-    """State machine for layouts where item/options/qty span multiple lines."""
-    products = []
-    cur_item = ""
-    cur_opts = ""
-    cur_qty = ""
-
-    def flush():
-        if cur_item:
-            products.append({"item": cur_item, "options": cur_opts, "qty": cur_qty})
-
-    for line in lines:
-        remainder, qty = _extract_qty_from_line(line)
-
-        if qty and remainder and _is_options_line(remainder):
-            # e.g. "Mattress Size: 5'0 King 1" OR "Ocean Dream Mattress Size: 5'0 King 1"
-            opts_m = OPTIONS_RE.search(remainder)
-            possible_item = remainder[:opts_m.start()].strip() if opts_m else ""
-            options_part = remainder[opts_m.start():].strip() if opts_m else remainder
-            if possible_item and re.match(r'[A-Z][a-z]', possible_item):
-                # Line contains both item name and options+qty
-                if cur_item:
-                    flush()
-                cur_item = possible_item
-                cur_opts = options_part
-                cur_qty = qty
-                flush()
-                cur_item = cur_opts = cur_qty = ""
-            elif cur_item:
-                cur_opts = options_part
-                cur_qty = qty
-                flush()
-                cur_item = cur_opts = cur_qty = ""
-            elif products:
-                products[-1]["options"] = options_part
-                products[-1]["qty"] = qty
-
-        elif qty and not remainder:
-            # Standalone qty line e.g. "1"
-            if cur_item:
-                cur_qty = qty
-                flush()
-                cur_item = cur_opts = cur_qty = ""
-            elif products and not products[-1]["qty"]:
-                products[-1]["qty"] = qty
-
-        elif qty and _is_item_name(remainder):
-            # "Ocean Dream 1" — item+qty, no options
-            if cur_item:
-                flush()
-            products.append({"item": remainder, "options": cur_opts, "qty": qty})
-            cur_item = cur_opts = cur_qty = ""
-
-        elif _is_options_line(line):
-            # Standalone options line — check if item name is embedded at start
-            opts_m = OPTIONS_RE.search(line)
-            possible_item = line[:opts_m.start()].strip() if opts_m else ""
-            options_part = line[opts_m.start():].strip() if opts_m else line
-            if possible_item and re.match(r'[A-Z][a-z]', possible_item) and not cur_item:
-                # e.g. "Ocean Dream Mattress Size: 5'0 King" (no qty yet)
-                if cur_item:
-                    flush()
-                cur_item = possible_item
-                cur_opts = options_part
-            elif cur_item:
-                cur_opts = options_part
-            elif products:
-                products[-1]["options"] = options_part
-
-        elif _is_item_name(line):
-            if cur_item:
-                flush()
-            cur_item = line
-            cur_opts = ""
-            cur_qty = ""
-
-    if cur_item:
-        flush()
-    return products
-
-
-def extract_products(text):
-    """
-    Extract product rows from the Product Selection section.
-    Handles ALL OCR layout variants via single-line parse then
-    state-machine fallback for split-line layouts.
-    """
-    lines = extract_section(
-        text,
-        r'Product\s+Selection',
-        r'Balance\s+owing|Authorisation|Authorization|VAT\s+NO'
-    )
-
-    # Filter noise
-    clean_lines = []
-    for line in lines:
-        if not line:
-            continue
-        if PRODUCT_HEADER_RE.search(line) and len(line.split()) <= 6:
-            continue
-        if SKU_RE.match(line):
-            continue
-        if re.match(r'^[\-\s\.]+$', line):
-            continue
-        clean_lines.append(line)
-
-    # Try single-line parser first (most common OCR output)
-    products = _parse_single_line(clean_lines)
-    if products:
-        return products
-
-    # Fall back to multi-line state machine
-    return _parse_multiline(clean_lines)
 
 
 # ── Response templates ────────────────────────────────────────────────────────
