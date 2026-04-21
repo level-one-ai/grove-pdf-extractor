@@ -425,26 +425,149 @@ def extract_ship_to(text):
 # ── Product extraction ────────────────────────────────────────────────────────
 
 SKU_RE = re.compile(r'^\d{5}/\d{5}', re.IGNORECASE)
-SECTION_END_RE = re.compile(
-    r'Balance\s+owing|Authorisation|Authorization|VAT\s+NO|Total\b',
+PRODUCT_HEADER_RE = re.compile(r'\bItem\b|\bOptions\b|\bQty\b', re.IGNORECASE)
+OPTIONS_RE = re.compile(
+    r'(Mattress\s+Size|Colour|Color|Size|Type|Option|Variant|Style|Grade|Spec)',
     re.IGNORECASE
 )
-PRODUCT_HEADER_RE = re.compile(r'\bItem\b|\bOptions\b|\bQty\b', re.IGNORECASE)
+
+
+def _is_options_line(line):
+    return bool(OPTIONS_RE.search(line))
+
+
+def _is_qty_only(line):
+    return bool(re.match(r'^\d+$', line.strip()))
+
+
+def _is_item_name(line):
+    if _is_qty_only(line):
+        return False
+    if SKU_RE.match(line):
+        return False
+    if _is_options_line(line):
+        return False
+    if re.match(r'[A-Z][a-z]', line):
+        return True
+    return False
+
+
+def _extract_qty_from_line(line):
+    """Return (remainder, qty_str) or (line, None) if no trailing integer."""
+    m = re.search(r'\s+(\d+)\s*$', line)
+    if m:
+        return line[:m.start()].strip(), m.group(1)
+    if re.match(r'^\d+$', line.strip()):
+        return "", line.strip()
+    return line, None
+
+
+def _parse_single_line(lines):
+    """Parse products where item+options+qty are all on one line."""
+    products = []
+    for line in lines:
+        remainder, qty = _extract_qty_from_line(line)
+        if qty is None:
+            continue
+        opts_m = OPTIONS_RE.search(remainder)
+        if opts_m:
+            item = remainder[:opts_m.start()].strip()
+            options = remainder[opts_m.start():].strip()
+        else:
+            parts = re.split(r'\s{2,}', remainder, maxsplit=1)
+            item = parts[0].strip()
+            options = parts[1].strip() if len(parts) > 1 else ""
+        if item:
+            products.append({"item": item, "options": options, "qty": qty})
+    return products
+
+
+def _parse_multiline(lines):
+    """State machine for layouts where item/options/qty span multiple lines."""
+    products = []
+    cur_item = ""
+    cur_opts = ""
+    cur_qty = ""
+
+    def flush():
+        if cur_item:
+            products.append({"item": cur_item, "options": cur_opts, "qty": cur_qty})
+
+    for line in lines:
+        remainder, qty = _extract_qty_from_line(line)
+
+        if qty and remainder and _is_options_line(remainder):
+            # e.g. "Mattress Size: 5'0 King 1" OR "Ocean Dream Mattress Size: 5'0 King 1"
+            opts_m = OPTIONS_RE.search(remainder)
+            possible_item = remainder[:opts_m.start()].strip() if opts_m else ""
+            options_part = remainder[opts_m.start():].strip() if opts_m else remainder
+            if possible_item and re.match(r'[A-Z][a-z]', possible_item):
+                # Line contains both item name and options+qty
+                if cur_item:
+                    flush()
+                cur_item = possible_item
+                cur_opts = options_part
+                cur_qty = qty
+                flush()
+                cur_item = cur_opts = cur_qty = ""
+            elif cur_item:
+                cur_opts = options_part
+                cur_qty = qty
+                flush()
+                cur_item = cur_opts = cur_qty = ""
+            elif products:
+                products[-1]["options"] = options_part
+                products[-1]["qty"] = qty
+
+        elif qty and not remainder:
+            # Standalone qty line e.g. "1"
+            if cur_item:
+                cur_qty = qty
+                flush()
+                cur_item = cur_opts = cur_qty = ""
+            elif products and not products[-1]["qty"]:
+                products[-1]["qty"] = qty
+
+        elif qty and _is_item_name(remainder):
+            # "Ocean Dream 1" — item+qty, no options
+            if cur_item:
+                flush()
+            products.append({"item": remainder, "options": cur_opts, "qty": qty})
+            cur_item = cur_opts = cur_qty = ""
+
+        elif _is_options_line(line):
+            # Standalone options line — check if item name is embedded at start
+            opts_m = OPTIONS_RE.search(line)
+            possible_item = line[:opts_m.start()].strip() if opts_m else ""
+            options_part = line[opts_m.start():].strip() if opts_m else line
+            if possible_item and re.match(r'[A-Z][a-z]', possible_item) and not cur_item:
+                # e.g. "Ocean Dream Mattress Size: 5'0 King" (no qty yet)
+                if cur_item:
+                    flush()
+                cur_item = possible_item
+                cur_opts = options_part
+            elif cur_item:
+                cur_opts = options_part
+            elif products:
+                products[-1]["options"] = options_part
+
+        elif _is_item_name(line):
+            if cur_item:
+                flush()
+            cur_item = line
+            cur_opts = ""
+            cur_qty = ""
+
+    if cur_item:
+        flush()
+    return products
 
 
 def extract_products(text):
     """
     Extract product rows from the Product Selection section.
-    Handles plain text table output from OCR.space (no isTable flag).
-
-    Each product row looks like:
-      "Ocean Dream                    Mattress Size: 5'0 King              1"
-    Followed by optional SKU lines:
-      "15373/65000 (X1)"
-
-    Strategy: find "Product Selection", read lines until end marker,
-    skip header and SKU lines, parse each data row by splitting off
-    the trailing integer (qty) and detecting the options separator.
+    Handles ALL OCR layout variants via single-line parse then
+    state-machine fallback for split-line layouts.
     """
     lines = extract_section(
         text,
@@ -452,53 +575,26 @@ def extract_products(text):
         r'Balance\s+owing|Authorisation|Authorization|VAT\s+NO'
     )
 
-    products = []
+    # Filter noise
+    clean_lines = []
     for line in lines:
         if not line:
             continue
-        # Skip the column header row
         if PRODUCT_HEADER_RE.search(line) and len(line.split()) <= 6:
             continue
-        # Skip SKU lines like "15373/65000 (X1)"
         if SKU_RE.match(line):
             continue
-        # Skip separator lines
         if re.match(r'^[\-\s\.]+$', line):
             continue
+        clean_lines.append(line)
 
-        # Try to split into item / options / qty
-        # Qty is always a trailing integer (1, 2, 3...)
-        qty_match = re.search(r'\s+(\d+)\s*$', line)
-        if not qty_match:
-            continue
+    # Try single-line parser first (most common OCR output)
+    products = _parse_single_line(clean_lines)
+    if products:
+        return products
 
-        qty = qty_match.group(1)
-        remainder = line[:qty_match.start()].strip()
-
-        # Options typically start with "Mattress Size:" or similar keyword
-        # Split on the first occurrence of a known options pattern
-        # First try keyword-based split (works even when OCR collapses spaces)
-        options_match = re.search(
-            r'(Mattress\s+Size[:\s]|Colour[:\s]|Color[:\s]|Size[:\s]|Type[:\s]|Option[:\s])',
-            remainder, re.IGNORECASE
-        )
-        if options_match:
-            item = remainder[:options_match.start()].strip()
-            options = remainder[options_match.start():].strip()
-        else:
-            # Fallback: split on 2+ spaces
-            parts = re.split(r'\s{2,}', remainder, maxsplit=1)
-            item = parts[0].strip()
-            options = parts[1].strip() if len(parts) > 1 else ""
-
-        if item:
-            products.append({
-                "item": item,
-                "options": options,
-                "qty": qty,
-            })
-
-    return products
+    # Fall back to multi-line state machine
+    return _parse_multiline(clean_lines)
 
 
 # ── Response templates ────────────────────────────────────────────────────────
@@ -588,6 +684,14 @@ class handler(BaseHTTPRequestHandler):
                 self._send_json(400, {"error": "No PDF file found in request."})
                 return
 
+            # Debug mode: ?debug=1 returns raw OCR text so you can see what OCR.space produced
+            from urllib.parse import urlparse, parse_qs
+            query = parse_qs(urlparse(self.path).query)
+            if query.get("debug", ["0"])[0] == "1":
+                raw_text = get_pdf_text(pdf_bytes)
+                self._send_json(200, {"debug": True, "raw_ocr_text": raw_text})
+                return
+
             result = extract_delivery_order(pdf_bytes)
             self._send_json(200, result)
 
@@ -598,7 +702,7 @@ class handler(BaseHTTPRequestHandler):
         self._send_json(200, {
             "status": "ok",
             "service": "Grove PDF Extractor",
-            "note": "POST a PDF as multipart/form-data (field: 'file'). Set OCR_SPACE_API_KEY on Vercel.",
+            "note": "POST a PDF as multipart/form-data (field: 'file'). Set OCR_SPACE_API_KEY on Vercel. Add ?debug=1 to POST to see raw OCR text.",
         })
 
     def _send_json(self, status_code, data):
