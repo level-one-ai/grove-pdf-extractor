@@ -166,7 +166,7 @@ def _extract_etd_ref(text):
                     etd = dm.group(1).strip()
                     # Ref is whatever comes after the date
                     after_date = vline[dm.end():].strip()
-                    rm = re.search(r'([A-Z]{2,}\d+[\w\-]*)', after_date)
+                    rm = re.search(r'([A-Z0-9][A-Z0-9\-]{2,})', after_date)
                     if rm:
                         ref = rm.group(1)
                 # Try date as dd/mm/yyyy
@@ -175,7 +175,7 @@ def _extract_etd_ref(text):
                     if dm2:
                         etd = dm2.group(1).strip()
                         after = vline[dm2.end():].strip()
-                        rm2 = re.search(r'([A-Z]{2,}\d+[\w\-]*)', after)
+                        rm2 = re.search(r'([A-Z0-9][A-Z0-9\-]{2,})', after)
                         if rm2:
                             ref = rm2.group(1)
                 break
@@ -214,7 +214,7 @@ def extract_header(text):
     if not ref:
         ref = find_by_regex(
             text,
-            r'Ref[\s:]+([A-Z]{2,}\d+[\w\-]*)',
+            r'Ref[\s:]+([A-Z0-9][A-Z0-9\-]{2,})',  # any alphanumeric ref code
         )
 
     # Invoice Number — must contain at least one digit to avoid matching label words
@@ -224,13 +224,13 @@ def extract_header(text):
         r'Inv(?:oice)?[\s.#:]+((?=[A-Z0-9\-/]*\d)[A-Z0-9\-/]+)',
     )
 
-    # Customer PO Number — must contain at least one digit
+    # Customer PO Number — 3+ chars, not a common document word
     customer_po_no = find_by_regex(
         text,
-        r'Customer\s+PO\s+No[\s:]+((?=[A-Z0-9\-/]*\d)[A-Z0-9\-/]+)',
-        r'Customer\s+PO[\s:]+((?=[A-Z0-9\-/]*\d)[A-Z0-9\-/]+)',
-        r'PO\s+No[\s:]+((?=[A-Z0-9\-/]*\d)[A-Z0-9\-/]+)',
-        r'Purchase\s+Order[\s:]+((?=[A-Z0-9\-/]*\d)[A-Z0-9\-/]+)',
+        r'Customer\s+PO\s+No[\s:]+(?!Delivery|Reference|Invoice|Customer|Ship|Number)([A-Z0-9][A-Z0-9\-/]{2,})',
+        r'Customer\s+PO[\s:]+(?!Delivery|Reference|Invoice|Customer|Ship|Number)([A-Z0-9][A-Z0-9\-/]{2,})',
+        r'PO\s+No[\s:]+(?!Delivery|Reference|Invoice|Customer|Ship|Number)([A-Z0-9][A-Z0-9\-/]{2,})',
+        r'Purchase\s+Order[\s:]+(?!Delivery|Reference|Invoice|Customer|Ship|Number)([A-Z0-9][A-Z0-9\-/]{2,})',
     )
 
     return {
@@ -273,6 +273,22 @@ def parse_address_lines(lines):
                 mobile = clean(m.group())
             continue
         addr_lines.append(l)
+
+    # Skip person-name-only lines that appear before the street address
+    # (e.g. 'Ted Baigan' appearing in a ship_to block after the company name)
+    PERSON_LINE_RE = re.compile(r'^[A-Z][a-z]+\s+[A-Z][a-z]+$')
+    SKIP_NAMES = {'United Kingdom', 'United States', 'Scotland', 'England', 'Wales', 'Ireland'}
+    seen_street = False
+    filtered_addr_lines = []
+    for line in addr_lines:
+        if STREET_TYPES_RE.search(line) or re.search(r'\d', line):
+            seen_street = True
+        if (not seen_street and PERSON_LINE_RE.match(line)
+                and line not in SKIP_NAMES
+                and not UK_POSTCODE_RE.search(line)):
+            continue  # skip person name before street
+        filtered_addr_lines.append(line)
+    addr_lines = filtered_addr_lines
 
     postcode = ""
     postcode_idx = None
@@ -352,7 +368,10 @@ def extract_section(text, start_pattern, end_pattern):
 STREET_TYPES_RE = re.compile(
     r'\b(?:Road|Street|Avenue|Lane|Way|Close|Drive|Court|Place|Terrace|'
     r'Gardens|Grove|Hill|Rise|Walk|Mews|Crescent|Square|Parade|Boulevard|'
-    r'Row|Circus|Wharf|Quay|Yard|Gate|View|Park|Estate)\b',
+    r'Row|Circus|Wharf|Quay|Yard|Gate|View|Park|Estate|Bank|Wynd|Loan|'
+    r'Brae|Causeway|Croft|Dell|Dene|Drove|Garth|Glade|Glen|Meadow|Mount|'
+    r'Orchard|Path|Ridge|Strand|Vale|Villa|Villas|Warren|Wood|Roundabout|'
+    r'Terrace|Approach|Arcade|Passage|Precinct|Promenade|Quayside|Ring)\b',
     re.IGNORECASE
 )
 UK_POSTCODE_RE = re.compile(r'\b([A-Z]{1,2}\d{1,2}[A-Z]?\s*\d[A-Z]{2})\b', re.IGNORECASE)
@@ -360,59 +379,96 @@ UK_POSTCODE_RE = re.compile(r'\b([A-Z]{1,2}\d{1,2}[A-Z]?\s*\d[A-Z]{2})\b', re.IG
 
 def _parse_flat_address(text):
     """
-    Parse a flat single-line address string (as returned by OCR.space when it
-    reads a page as one continuous block without line breaks) into structured fields.
-
-    Expected pattern: "[Company] [Person Name] [Street Lines] [City], [Region] [PostCode]"
+    Parse a flat single-line address string into structured fields.
+    Handles all Grove customer address formats:
+    - Individual: "Graeme Markham 50 Broomhouse Bank Edinburgh EH11 3TL"
+    - Company + person: "Brigend Trading Ted Baigan 17 Old Dalkeith Road Edinburgh EH16 4TE"
+    - Company = person: "Cullen Property Cullen Property 30 Rutland Square Edinburgh EH1 2BW"
+    - Loren Williams format: "Abingdon Beds Ltd Ashley Alsworth The Retail Warehouse Marcham Road Abingdon, Oxfordshire OX14 1TZ"
     """
-    empty = {"street": "", "city": "", "region": "", "postcode": "", "country": "United Kingdom"}
-    result = dict(empty)
-    company = ""
-    name = ""
+    COMPANY_KW = re.compile(
+        r'\b(Ltd|Limited|PLC|LLP|Inc|Group|Property|Trading|Services|Hotel|' 
+        r'House|Lodge|Letting|Rentals|Investments|Management|Consultancy|' 
+        r'Associates|Partners|Trust|Foundation|Concierge|Bedding)\b',
+        re.IGNORECASE
+    )
 
     pc_m = UK_POSTCODE_RE.search(text)
     if not pc_m:
-        return company, name, result
+        return None, "", {"street": "", "city": "", "region": "", "postcode": "", "country": "United Kingdom"}
 
-    result["postcode"] = pc_m.group(1).strip()
+    postcode = pc_m.group(1).strip()
     before_pc = text[:pc_m.start()].strip().rstrip(",")
+    after_pc = text[pc_m.end():].strip()
 
-    # Region: text after last comma (before postcode)
+    # Region: text after last comma before postcode
     if "," in before_pc:
         comma_idx = before_pc.rfind(",")
-        result["region"] = before_pc[comma_idx + 1:].strip()
+        region = before_pc[comma_idx + 1:].strip()
         before_region = before_pc[:comma_idx].strip()
     else:
+        region = ""
         before_region = before_pc
 
-    # City: text after last street type word
-    street_matches = list(STREET_TYPES_RE.finditer(before_region))
-    if street_matches:
-        last_st = street_matches[-1]
-        result["city"] = before_region[last_st.end():].strip()
-        before_city = before_region[:last_st.end()].strip()
+    # City: last word after last street type (handles "Morningside Edinburgh" -> "Edinburgh")
+    st_ms = list(STREET_TYPES_RE.finditer(before_region))
+    if st_ms:
+        after_st = before_region[st_ms[-1].end():].strip()
+        before_st = before_region[:st_ms[-1].end()].strip()
+        if "," in after_st:
+            city = after_st.rsplit(",", 1)[-1].strip()
+        else:
+            city_words = after_st.split()
+            city = city_words[-1] if city_words else ""
     else:
         words = before_region.rsplit(None, 1)
-        result["city"] = words[-1] if len(words) > 1 else ""
-        before_city = words[0] if len(words) > 1 else before_region
+        city = words[-1] if len(words) > 1 else ""
+        before_st = words[0] if len(words) > 1 else before_region
 
-    # Company: text up to "Ltd / Limited / PLC / LLP"
-    company_m = re.search(r'\b(Ltd|Limited|PLC|LLP|Inc|Group)\b', before_city, re.IGNORECASE)
+    # Company detection
+    company = None
+    person = ""
+    street = ""
+
+    company_m = COMPANY_KW.search(before_st)
     if company_m:
-        company = before_city[:company_m.end()].strip()
-        after_company = before_city[company_m.end():].strip()
-    else:
-        after_company = before_city
+        company = before_st[:company_m.end()].strip()
+        after_company = before_st[company_m.end():].strip()
 
-    # Person name: first two consecutive Title Case words
-    name_m = re.match(r'([A-Z][a-z]+\s+[A-Z][a-z]+)(?=\s|$)', after_company)
-    if name_m:
-        name = name_m.group(1)
-        result["street"] = after_company[name_m.end():].strip()
+        # Check if company name repeats (e.g. "Cullen Property Cullen Property 30...")
+        cwords = company.split()
+        awords = after_company.split()
+        if len(awords) >= len(cwords) and awords[:len(cwords)] == cwords:
+            # Repeated - person = company, rest is street
+            person = company
+            street = " ".join(awords[len(cwords):])
+        else:
+            # Different name follows - extract person (2 title-case words)
+            name_m = re.match(r'([A-Z][a-z]+\s+[A-Z][a-z]+)(?=\s|$)', after_company)
+            if name_m:
+                person = name_m.group(1)
+                street = after_company[name_m.end():].strip()
+            else:
+                person = ""
+                street = after_company
     else:
-        result["street"] = after_company
+        # No company keyword - look for person name (2 title-case words)
+        name_m = re.match(r'([A-Z][a-z]+\s+[A-Z][a-z]+)(?=\s|$)', before_st)
+        if name_m:
+            person = name_m.group(1)
+            street = before_st[name_m.end():].strip()
+        else:
+            person = ""
+            street = before_st
 
-    return company, name, result
+    addr = {
+        "street": street,
+        "city": city,
+        "region": region,
+        "postcode": postcode,
+        "country": after_pc.strip() or "United Kingdom",
+    }
+    return company, person, addr
 
 
 def extract_customer(text):
@@ -427,28 +483,55 @@ def extract_customer(text):
         empty_addr = {"street": "", "city": "", "region": "", "postcode": "", "country": "United Kingdom"}
         return None, "", empty_addr, "", ""
 
+    # Check if 'Customer:' and 'Ship To:' are on the same line (two-column layout)
+    rest_of_line_m = re.search(r'[^\n]*', text[cust_m.end():], re.IGNORECASE)
+    rest_of_line = rest_of_line_m.group() if rest_of_line_m else ''
+    same_line_ship = bool(re.search(r'Ship\s+To:', rest_of_line, re.IGNORECASE))
+
     # Find end of customer block (stop before Phone:, Product Selection, or Ship To:)
-    cust_end_m = re.search(r'Phone:|Mobile:|Product\s+Selection|Ship\s+To:', text[cust_m.end():], re.IGNORECASE)
-    cust_block = text[cust_m.end(): cust_m.end() + cust_end_m.start()].strip() if cust_end_m else text[cust_m.end():].strip()
+    # If Ship To: is on the same line as Customer:, skip to the line AFTER
+    search_start = cust_m.end()
+    if same_line_ship:
+        # Move past the current line
+        newline_m = re.search(r'\n', text[search_start:])
+        if newline_m:
+            search_start += newline_m.end()
+    cust_end_m = re.search(r'Phone:|Mobile:|Product\s+Selection|Ship\s+To:', text[search_start:], re.IGNORECASE)
+    cust_block = text[search_start: search_start + cust_end_m.start()].strip() if cust_end_m else text[search_start:].strip()
 
     # Phone / mobile from full text
     phone = ""
     mobile = ""
-    ph_m = re.search(r'Phone\s*:\s*([\d][\d\s\-\+\(\)]{5,})', text, re.IGNORECASE)
-    mob_m = re.search(r'Mobile\s*:\s*([\d][\d\s\-\+\(\)]{5,})', text, re.IGNORECASE)
+    ph_m = re.search(r'Phone\s*:\s*([\+\d][\d\s\-\+\(\)]{5,})', text, re.IGNORECASE)
+    mob_m = re.search(r'Mobile\s*:\s*([\+\d][\d\s\-\+\(\)]{5,})', text, re.IGNORECASE)
     if ph_m:
-        phone = ph_m.group(1).strip()
+        phone = re.sub(r'[^\d]+$', '', ph_m.group(1)).strip()
     if mob_m:
-        mobile = mob_m.group(1).strip()
+        mobile = re.sub(r'[^\d]+$', '', mob_m.group(1)).strip()
 
     # Check if block has newlines (multi-line OCR) or is flat
     lines = [l.strip() for l in cust_block.split('\n') if l.strip()]
 
     if len(lines) >= 3:
         # Multi-line: parse line by line
-        company_name = lines[0]
-        cust_name = lines[1] if len(lines) > 1 else ""
-        addr_lines = [l for l in lines[2:] if not re.search(r'Phone|Mobile', l, re.IGNORECASE)]
+        # Detect if lines[0] is a person name (individual customer, no company)
+        PERSON_RE = re.compile(r'^[A-Z][a-z]+\s+[A-Z][a-z]+(\s+[A-Z][a-z]+)?$')
+        COMPANY_KW2 = re.compile(
+            r'\b(Ltd|Limited|PLC|LLP|Inc|Group|Property|Trading|Services|Hotel|'
+            r'House|Lodge|Letting|Rentals|Investments|Management|Concierge|'
+            r'Bedding|Edinburgh|Home|In)\b', re.IGNORECASE
+        )
+        first_line = lines[0]
+        if PERSON_RE.match(first_line) and not COMPANY_KW2.search(first_line):
+            # Individual customer: first line is the person name, no company
+            company_name = None
+            cust_name = first_line
+            addr_lines = [l for l in lines[1:] if not re.search(r'Phone|Mobile', l, re.IGNORECASE)]
+        else:
+            # Company customer: first line is company, second is person name
+            company_name = first_line
+            cust_name = lines[1] if len(lines) > 1 else ""
+            addr_lines = [l for l in lines[2:] if not re.search(r'Phone|Mobile', l, re.IGNORECASE)]
         addr, p, m = parse_address_lines(addr_lines)
         if p: phone = p
         if m: mobile = m
@@ -500,16 +583,32 @@ def parse_address_lines(lines):
         if not l:
             continue
         if re.search(r'\bphone\b|\btel\b', l, re.IGNORECASE):
-            m = re.search(r'[\d][\d\s\-\+\(\)]{6,}', l)
+            m = re.search(r'[\+\d][\d\s\-\+\(\)]{6,}', l)
             if m:
-                phone = m.group().strip()
+                phone = re.sub(r'[^\d]+$', '', m.group()).strip()
             continue
         if re.search(r'\bmobile\b|\bmob\b', l, re.IGNORECASE):
-            m = re.search(r'[\d][\d\s\-\+\(\)]{6,}', l)
+            m = re.search(r'[\+\d][\d\s\-\+\(\)]{6,}', l)
             if m:
-                mobile = m.group().strip()
+                mobile = re.sub(r'[^\d]+$', '', m.group()).strip()
             continue
         addr_lines.append(l)
+
+    # Skip person-name-only lines that appear before the street address
+    # (e.g. 'Ted Baigan' appearing in a ship_to block after the company name)
+    PERSON_LINE_RE = re.compile(r'^[A-Z][a-z]+\s+[A-Z][a-z]+$')
+    SKIP_NAMES = {'United Kingdom', 'United States', 'Scotland', 'England', 'Wales', 'Ireland'}
+    seen_street = False
+    filtered_addr_lines = []
+    for line in addr_lines:
+        if STREET_TYPES_RE.search(line) or re.search(r'\d', line):
+            seen_street = True
+        if (not seen_street and PERSON_LINE_RE.match(line)
+                and line not in SKIP_NAMES
+                and not UK_POSTCODE_RE.search(line)):
+            continue  # skip person name before street
+        filtered_addr_lines.append(line)
+    addr_lines = filtered_addr_lines
 
     postcode = ""
     postcode_idx = None
@@ -556,8 +655,14 @@ def parse_address_lines(lines):
 
 SKU_RE = re.compile(r'\b\d{5}/\d{5}', re.IGNORECASE)
 PRODUCT_HEADER_RE = re.compile(r'\bItem\b|\bOptions\b|\bQty\b', re.IGNORECASE)
+# OPT_KW_RE matches option LABELS (always followed by a colon)
+# This prevents splitting on option words that appear inside product names
+# e.g. 'Purecare Cotton Mattress Protector' must NOT split at 'Mattress'
+# but 'Ocean Dream Mattress Size: 5\'0 King' MUST split at 'Mattress Size:'
 OPT_KW_RE = re.compile(
-    r'(?:Mattress|Colour|Color|Divan|Headboard|Ottoman|Fabric|Leather)',
+    r'(?:Mattress\s+Size|Bed\s+Frame\s+Size|Headboard\s+(?:Size|Height)|'
+    r'Pillow\s+Option|Colour|Color|Storage|Height|Width|Depth|Size)'
+    r'(?:\s*:|\s+\w+\s*:)',
     re.IGNORECASE
 )
 
@@ -617,15 +722,18 @@ def extract_products(text):
 
     # ── 2. Parse options ──────────────────────────────────────────────────
     # Split on each re-occurrence of the option keyword
-    options_list = [
-        o.strip()
-        for o in re.split(r'(?=\b(?:' + OPT_KW_RE.pattern + r')\b)', options_text, flags=re.IGNORECASE)
-        if o.strip()
-    ]
+    # Split options strip on re-occurrence of option label keywords
+    _OPT_SPLIT = re.compile(
+        r'(?=(?:Mattress\s+Size|Bed\s+Frame\s+Size|Headboard\s+(?:Size|Height)|'
+        r'Pillow\s+Option|Colour|Color|Storage|Height|Width|Depth|Size)'
+        r'(?:\s*:|\s+\w+\s*:))',
+        re.IGNORECASE
+    )
+    options_list = [o.strip() for o in _OPT_SPLIT.split(options_text) if o.strip()]
 
     # ── 3. Parse qty section ──────────────────────────────────────────────
     # Leading integers are qtys; any remaining text is the last option
-    leading_m = re.match(r'^([\d\s]+)', qty_text)
+    leading_m = re.match(r'^([\d\s\#\/]+)', qty_text)
     qty_list = re.findall(r'\d+', leading_m.group(1)) if leading_m else []
     remainder = qty_text[leading_m.end():].strip() if leading_m else qty_text
 
@@ -721,8 +829,12 @@ def build_response(header, company_name, cust_name, cust_addr, phone, mobile,
 def extract_delivery_order(pdf_bytes):
     full_text = get_pdf_text(pdf_bytes)
 
-    # Gatekeeper
-    if "delivery order" not in full_text.lower():
+    # Gatekeeper — only process Delivery Orders
+    text_lower = full_text.lower()
+    if "delivery order" not in text_lower:
+        return other_response()
+    # Explicitly reject Branch Transfers even if they somehow contain the phrase
+    if "branch transfer" in text_lower:
         return other_response()
 
     header = extract_header(full_text)
