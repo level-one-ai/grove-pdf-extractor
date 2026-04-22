@@ -749,12 +749,14 @@ def extract_products(text):
             qty_list.append('1')
 
     # ── 4. Zip into products ──────────────────────────────────────────────
+    # Strip newlines/tabs so Make.com's toString() produces JSON-safe strings
+    def _clean(s): return ' '.join(str(s).split()).strip()
     products = []
     for i, name in enumerate(item_names):
         products.append({
-            'item': name,
-            'options': options_list[i] if i < len(options_list) else '',
-            'qty': qty_list[i] if i < len(qty_list) else '',
+            'item': _clean(name),
+            'options': _clean(options_list[i] if i < len(options_list) else ''),
+            'qty': _clean(qty_list[i] if i < len(qty_list) else ''),
         })
 
     return products
@@ -789,8 +791,9 @@ def _parse_line_based(text):
             parts = re.split(r'\s{2,}', remainder, maxsplit=1)
             item = parts[0].strip()
             options = parts[1].strip() if len(parts) > 1 else ''
+        def _cl(s): return ' '.join(str(s).split()).strip()
         if item and not SKU_RE.match(item):
-            products.append({'item': item, 'options': options, 'qty': qty})
+            products.append({'item': _cl(item), 'options': _cl(options), 'qty': _cl(qty)})
 
     return products
 
