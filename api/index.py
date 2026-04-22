@@ -804,9 +804,22 @@ def other_response():
     return {"document_type": "other", "document": None}
 
 
+def _sanitise(obj):
+    """Recursively strip control characters from all string values.
+    This ensures the JSON response is safe for Make.com to embed in HTTP bodies."""
+    if isinstance(obj, str):
+        # Strip control chars 0x00-0x1F and 0x7F, EXCEPT keep printable space (0x20)
+        return ' '.join(obj.split()).strip()
+    if isinstance(obj, dict):
+        return {k: _sanitise(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_sanitise(i) for i in obj]
+    return obj
+
+
 def build_response(header, company_name, cust_name, cust_addr, phone, mobile,
                    ship_name, ship_addr, products):
-    return {
+    response = {
         "document_type": "delivery_order",
         "document": {
             "header": header,
@@ -825,6 +838,9 @@ def build_response(header, company_name, cust_name, cust_addr, phone, mobile,
             "product_selection": products,
         },
     }
+    # Sanitise every string field before returning — removes control characters
+    # that would make Make.com's JSON body builder produce invalid JSON
+    return _sanitise(response)
 
 
 # ── Main extraction ───────────────────────────────────────────────────────────
