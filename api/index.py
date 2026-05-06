@@ -843,17 +843,57 @@ def build_response(header, company_name, cust_name, cust_addr, phone, mobile,
     return _sanitise(response)
 
 
+def is_likely_delivery_order(text_lower, full_text):
+    """
+    Lenient gatekeeper for Grove delivery orders.
+
+    Returns True if either:
+    A) The exact phrase 'delivery order' appears (the strict legacy check), OR
+    B) The page has at least 2 of the following Grove-delivery-order signals,
+       which catches cases where 'delivery order' is OCR-clipped (e.g. 'delivery orde').
+
+    Branch Transfer pages are always rejected.
+    """
+    # Always reject Branch Transfers regardless of other signals
+    if "branch transfer" in text_lower:
+        return False
+
+    # Strict legacy check
+    if "delivery order" in text_lower:
+        return True
+
+    # Lenient fallback — count Grove-specific signals
+    signals = 0
+    # Signal 1: Grove brand mentioned anywhere
+    if "grove" in text_lower:
+        signals += 1
+    # Signal 2: Cin7-style reference pattern (4 capital letters + 5 digits + dash + digit)
+    if re.search(r'\b[A-Z]{4}\d{5}-\d+\b', full_text):
+        signals += 1
+    # Signal 3: Common delivery-order field labels
+    if "ship to" in text_lower:
+        signals += 1
+    # Signal 4: ETD field (estimated time of delivery)
+    if re.search(r'\betd\b', text_lower):
+        signals += 1
+    # Signal 5: Customer PO No or Customer: label
+    if "customer po" in text_lower or "customer:" in text_lower:
+        signals += 1
+    # Signal 6: A clipped variant of 'delivery order' from poor OCR
+    if "delivery orde" in text_lower or "elivery order" in text_lower:
+        signals += 1
+
+    # Need at least 2 signals to accept as a delivery order
+    return signals >= 2
+
+
 # ── Main extraction ───────────────────────────────────────────────────────────
 
 def extract_delivery_order(pdf_bytes):
     full_text = get_pdf_text(pdf_bytes)
 
-    # Gatekeeper — only process Delivery Orders
     text_lower = full_text.lower()
-    if "delivery order" not in text_lower:
-        return other_response()
-    # Explicitly reject Branch Transfers even if they somehow contain the phrase
-    if "branch transfer" in text_lower:
+    if not is_likely_delivery_order(text_lower, full_text):
         return other_response()
 
     header = extract_header(full_text)
