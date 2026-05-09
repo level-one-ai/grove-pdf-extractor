@@ -26,6 +26,7 @@ import cgi
 import os
 import urllib.request
 import urllib.error
+import socket
 import pdfplumber
 from http.server import BaseHTTPRequestHandler
 
@@ -57,6 +58,11 @@ def extract_text_with_ocrspace(pdf_bytes):
     Send a single-page PDF to OCR.space and return plain text.
     Free tier: 500 requests/day, no per-second rate limit.
     Each page arrives already split by the Grove PDF Router.
+
+    Timeout note: Make.com's HTTP module times out at 40s. We use 30s for
+    OCR.space so the extractor can return a graceful error before Make.com
+    gives up — otherwise the extractor returns a result Make.com has already
+    disconnected from, wasting the work.
     """
     api_key = os.environ.get("OCR_SPACE_API_KEY", "helloworld")
 
@@ -92,8 +98,14 @@ def extract_text_with_ocrspace(pdf_bytes):
         method="POST",
     )
 
-    with urllib.request.urlopen(req, timeout=55) as resp:
-        result = json.loads(resp.read().decode("utf-8"))
+    # 30s timeout — Make.com gives up at 40s, so we leave a 10s buffer to return
+    # a graceful error rather than letting Make.com disconnect mid-response.
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            result = json.loads(resp.read().decode("utf-8"))
+    except (urllib.error.URLError, TimeoutError, socket.timeout) as e:
+        # Convert a slow/failed OCR call into a clean error response.
+        raise ValueError("OCR.space timeout or network error: " + str(e))
 
     parsed = result.get("ParsedResults", [])
     if not parsed:
@@ -852,10 +864,15 @@ def is_likely_delivery_order(text_lower, full_text):
     B) The page has at least 2 of the following Grove-delivery-order signals,
        which catches cases where 'delivery order' is OCR-clipped (e.g. 'delivery orde').
 
-    Branch Transfer pages are always rejected.
+    Branch Transfer and Delivery Return pages are always rejected.
     """
-    # Always reject Branch Transfers regardless of other signals
+    # Always reject Branch Transfers and Delivery Returns regardless of other signals
     if "branch transfer" in text_lower:
+        return False
+    if "delivery return" in text_lower:
+        return False
+    # Sealy returns also commonly use this exact phrase as a watermark
+    if re.search(r'\bcollection\b', text_lower) and re.search(r'\breturn\s+date\b|\bstore\s+reference\b', text_lower):
         return False
 
     # Strict legacy check
@@ -882,6 +899,9 @@ def is_likely_delivery_order(text_lower, full_text):
     # Signal 6: A clipped variant of 'delivery order' from poor OCR
     if "delivery orde" in text_lower or "elivery order" in text_lower:
         signals += 1
+    # Signal 7: Loren Williams brand (their delivery orders also flow through Grove)
+    if "loren williams" in text_lower:
+        signals += 1
 
     # Need at least 2 signals to accept as a delivery order
     return signals >= 2
@@ -900,6 +920,39 @@ def extract_delivery_order(pdf_bytes):
     company_name, cust_name, cust_addr, phone, mobile = extract_customer(full_text)
     ship_name, ship_addr = extract_ship_to(full_text)
     products = extract_products(full_text)
+
+    # ── Ship-to fallback ──────────────────────────────────────────────────
+    # If the Customer block was partially OCR'd (giving us no usable name) but
+    # the Ship To block parsed cleanly, copy the ship-to identity into the
+    # customer fields so downstream Cin7 lookup still has something to work with.
+    # This covers the common scan-edge case where the left side of the page is
+    # cut off, leaving the Customer block fragmented but Ship To intact.
+    customer_is_unusable = (
+        (not cust_name or len(cust_name.strip()) < 3)
+        and (not company_name or len(company_name.strip()) < 3)
+    )
+    ship_is_usable = bool(ship_name and len(ship_name.strip()) >= 3)
+    if customer_is_unusable and ship_is_usable:
+        # Use ship-to identity for customer
+        # ship_name from extract_ship_to is the company name (or person name fallback)
+        # We need to detect whether it's a company or a person name for proper field assignment
+        COMPANY_KW = re.compile(
+            r'\b(Ltd|Limited|PLC|LLP|Inc|Group|Property|Trading|Services|Hotel|'
+            r'House|Lodge|Letting|Rentals|Investments|Management|Concierge|'
+            r'Bedding|Rooms|Furniture|Beds|Designer|Interiors|Sleep|Home|In)\b',
+            re.IGNORECASE
+        )
+        if COMPANY_KW.search(ship_name):
+            company_name = ship_name
+            # If ship block had a person name on line 2, use that as cust_name
+            # extract_ship_to currently returns just the first line as name, so we
+            # don't have a separate person name — leave cust_name empty.
+            if not cust_name:
+                cust_name = ""
+        else:
+            # ship_name looks like a person name
+            cust_name = ship_name
+        cust_addr = ship_addr
 
     return build_response(
         header, company_name, cust_name, cust_addr, phone, mobile,
