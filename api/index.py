@@ -857,53 +857,86 @@ def build_response(header, company_name, cust_name, cust_addr, phone, mobile,
 
 def is_likely_delivery_order(text_lower, full_text):
     """
-    Lenient gatekeeper for Grove delivery orders.
+    Strict gatekeeper for Grove / Sealy / Loren Williams delivery orders.
 
-    Returns True if either:
-    A) The exact phrase 'delivery order' appears (the strict legacy check), OR
-    B) The page has at least 2 of the following Grove-delivery-order signals,
-       which catches cases where 'delivery order' is OCR-clipped (e.g. 'delivery orde').
+    Accept ONLY if:
+    A) The exact phrase 'delivery order' appears (strict legacy check), OR
+    B) The lenient mode detects a known SUPPLIER (Grove / Sealy / Loren Williams)
+       in the title region of the document AND has at least 2 supporting signals.
 
-    Branch Transfer and Delivery Return pages are always rejected.
+    Explicitly REJECT:
+    - Packing lists (Hypnos, many others)
+    - Delivery returns (Sealy-style returns)
+    - Branch transfers (internal stock moves)
+    - Invoices (financial documents, not delivery)
+    - Purchase orders (orders TO suppliers, not deliveries FROM them)
     """
-    # Always reject Branch Transfers and Delivery Returns regardless of other signals
+    # ── Hard rejections — these document types are never delivery orders ──
+    if "packing list" in text_lower:
+        return False
     if "branch transfer" in text_lower:
         return False
     if "delivery return" in text_lower:
         return False
-    # Sealy returns also commonly use this exact phrase as a watermark
+    # Sealy returns also use a "COLLECTION + Return Date" watermark pattern
     if re.search(r'\bcollection\b', text_lower) and re.search(r'\breturn\s+date\b|\bstore\s+reference\b', text_lower):
         return False
+    # Invoices (financial documents)
+    if re.search(r'\b(?:tax\s+)?invoice\b', text_lower) and "delivery order" not in text_lower:
+        # 'Invoice Number' field on a delivery order is fine; the standalone word as a title is not
+        # Check if 'invoice' appears as a document-type header (early in the text)
+        first_200_chars = text_lower[:200]
+        if "invoice" in first_200_chars and "delivery order" not in first_200_chars:
+            return False
+    # Purchase orders (orders TO suppliers, not delivery FROM them)
+    if "purchase order" in text_lower and "delivery order" not in text_lower:
+        return False
 
-    # Strict legacy check
+    # ── Strict legacy check ──
     if "delivery order" in text_lower:
         return True
 
-    # Lenient fallback — count Grove-specific signals
+    # ── Lenient fallback: must detect a known supplier in the TITLE region ──
+    # The title region is the first 300 characters (top of the document).
+    # Just mentioning "grove" anywhere (e.g. in the delivery address of a non-Grove document)
+    # is NOT enough — it must look like a Grove/Sealy/Loren Williams delivery order header.
+    title_region = full_text[:300].lower()
+
+    supplier_in_title = False
+    # Grove: title contains "GROVE" prominently (not just "grove bedding" as an address)
+    if re.search(r'\bgrove\b', title_region) and not re.search(r'delivery\s+address.*grove|to[:\s]+grove', title_region):
+        supplier_in_title = True
+    # Sealy: title contains "SEALY" prominently
+    if "sealy" in title_region:
+        supplier_in_title = True
+    # Loren Williams: title contains the brand name
+    if "loren williams" in title_region or "lorenwilliams" in title_region:
+        supplier_in_title = True
+
+    if not supplier_in_title:
+        return False
+
+    # ── Supplier was detected. Now count supporting signals (need at least 2). ──
     signals = 0
-    # Signal 1: Grove brand mentioned anywhere
-    if "grove" in text_lower:
-        signals += 1
-    # Signal 2: Cin7-style reference pattern (4 capital letters + 5 digits + dash + digit)
+    # Cin7-style reference pattern (e.g. DROO1721-75)
     if re.search(r'\b[A-Z]{4}\d{5}-\d+\b', full_text):
         signals += 1
-    # Signal 3: Common delivery-order field labels
+    # Ship To label (Grove and Loren Williams delivery orders have this)
     if "ship to" in text_lower:
         signals += 1
-    # Signal 4: ETD field (estimated time of delivery)
+    # ETD field
     if re.search(r'\betd\b', text_lower):
         signals += 1
-    # Signal 5: Customer PO No or Customer: label
-    if "customer po" in text_lower or "customer:" in text_lower:
+    # Customer PO label (NOT the generic "Customer:" label which can appear on many docs)
+    if "customer po" in text_lower:
         signals += 1
-    # Signal 6: A clipped variant of 'delivery order' from poor OCR
+    # A clipped variant of 'delivery order' from poor OCR
     if "delivery orde" in text_lower or "elivery order" in text_lower:
         signals += 1
-    # Signal 7: Loren Williams brand (their delivery orders also flow through Grove)
-    if "loren williams" in text_lower:
+    # Product Selection (Grove/Loren delivery orders have this heading)
+    if "product selection" in text_lower:
         signals += 1
 
-    # Need at least 2 signals to accept as a delivery order
     return signals >= 2
 
 
