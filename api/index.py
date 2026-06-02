@@ -127,11 +127,13 @@ def get_pdf_text(pdf_bytes):
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
 def clean(value):
-    """Strip whitespace and collapse internal spaces."""
+    """Strip whitespace, collapse internal spaces, and remove stray leading/trailing
+    punctuation characters that OCR introduces (e.g. a quote mark before Loren Williams)."""
     if value is None:
         return ""
     v = str(value).strip()
     v = re.sub(r'\s+', ' ', v)
+    v = v.strip('"'}“”‘’'.replace("}", "`"))
     return v.strip()
 
 
