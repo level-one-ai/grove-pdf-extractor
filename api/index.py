@@ -28,7 +28,7 @@ import urllib.request
 import urllib.error
 import socket
 import pdfplumber
-from http.server import BaseHTTPRequestHandler
+from urllib.parse import urlparse, parse_qs
 
 
 # ── Text extraction ────────────────────────────────────────────────────────────
@@ -128,12 +128,12 @@ def get_pdf_text(pdf_bytes):
 
 def clean(value):
     """Strip whitespace, collapse internal spaces, and remove stray leading/trailing
-    punctuation characters that OCR introduces (e.g. a quote mark before Loren Williams)."""
+    punctuation characters that OCR introduces (e.g. a quote mark before 'Loren Williams')."""
     if value is None:
         return ""
     v = str(value).strip()
     v = re.sub(r'\s+', ' ', v)
-    v = v.strip('"'}“”‘’'.replace("}", "`"))
+    v = v.strip('"\'\u201c\u201d\u2018\u2019`')
     return v.strip()
 
 
@@ -997,71 +997,85 @@ def extract_delivery_order(pdf_bytes):
 
 # ── HTTP Handler ──────────────────────────────────────────────────────────────
 
-class handler(BaseHTTPRequestHandler):
+def _json_response(status, data):
+    body = json.dumps(data, indent=2).encode("utf-8")
+    return (
+        str(status),
+        [
+            ("Content-Type", "application/json"),
+            ("Content-Length", str(len(body))),
+            ("Access-Control-Allow-Origin", "*"),
+        ],
+        body,
+    )
 
-    def do_POST(self):
-        try:
-            content_type = self.headers.get("Content-Type", "")
-            pdf_bytes = None
 
-            if "multipart/form-data" in content_type:
-                form = cgi.FieldStorage(
-                    fp=self.rfile,
-                    headers=self.headers,
-                    environ={"REQUEST_METHOD": "POST", "CONTENT_TYPE": content_type},
-                )
-                for field_name in ["file", "pdf", "document"]:
-                    if field_name in form and hasattr(form[field_name], "file"):
-                        pdf_bytes = form[field_name].file.read()
-                        break
-                if pdf_bytes is None:
-                    for key in form.keys():
-                        item = form[key]
-                        if hasattr(item, "file") and item.file:
-                            pdf_bytes = item.file.read()
-                            break
+def app(environ, start_response):
+    method = environ.get("REQUEST_METHOD", "GET")
 
-            elif "application/pdf" in content_type or "application/octet-stream" in content_type:
-                content_length = int(self.headers.get("Content-Length", 0))
-                pdf_bytes = self.rfile.read(content_length)
-
-            else:
-                self._send_json(400, {"error": "Send PDF as multipart/form-data (field: 'file') or application/pdf body."})
-                return
-
-            if not pdf_bytes:
-                self._send_json(400, {"error": "No PDF file found in request."})
-                return
-
-            # Debug mode: ?debug=1 returns raw OCR text so you can see what OCR.space produced
-            from urllib.parse import urlparse, parse_qs
-            query = parse_qs(urlparse(self.path).query)
-            if query.get("debug", ["0"])[0] == "1":
-                raw_text = get_pdf_text(pdf_bytes)
-                self._send_json(200, {"debug": True, "raw_ocr_text": raw_text})
-                return
-
-            result = extract_delivery_order(pdf_bytes)
-            self._send_json(200, result)
-
-        except Exception as e:
-            self._send_json(500, {"error": str(e)})
-
-    def do_GET(self):
-        self._send_json(200, {
+    if method == "GET":
+        status, headers, body = _json_response(200, {
             "status": "ok",
             "service": "Grove PDF Extractor",
             "note": "POST a PDF as multipart/form-data (field: 'file'). Set OCR_SPACE_API_KEY on Vercel. Add ?debug=1 to POST to see raw OCR text.",
         })
+        start_response(status + " OK", headers)
+        return [body]
 
-    def _send_json(self, status_code, data):
-        body = json.dumps(data, indent=2).encode("utf-8")
-        self.send_response(status_code)
-        self.send_header("Content-Type", "application/json")
-        self.send_header("Content-Length", str(len(body)))
-        self.send_header("Access-Control-Allow-Origin", "*")
-        self.end_headers()
-        self.wfile.write(body)
+    if method != "POST":
+        status, headers, body = _json_response(405, {"error": "Method not allowed"})
+        start_response(status + " Method Not Allowed", headers)
+        return [body]
 
-    def log_message(self, format, *args):
-        pass
+    try:
+        content_type = environ.get("CONTENT_TYPE", "")
+        pdf_bytes = None
+
+        if "multipart/form-data" in content_type:
+            form = cgi.FieldStorage(
+                fp=environ["wsgi.input"],
+                environ=environ,
+                keep_blank_values=True,
+            )
+            for field_name in ["file", "pdf", "document"]:
+                if field_name in form and hasattr(form[field_name], "file"):
+                    pdf_bytes = form[field_name].file.read()
+                    break
+            if pdf_bytes is None:
+                for key in form.keys():
+                    item = form[key]
+                    if hasattr(item, "file") and item.file:
+                        pdf_bytes = item.file.read()
+                        break
+
+        elif "application/pdf" in content_type or "application/octet-stream" in content_type:
+            content_length = int(environ.get("CONTENT_LENGTH", 0) or 0)
+            pdf_bytes = environ["wsgi.input"].read(content_length)
+
+        else:
+            status, headers, body = _json_response(400, {"error": "Send PDF as multipart/form-data (field: 'file') or application/pdf body."})
+            start_response(status + " Bad Request", headers)
+            return [body]
+
+        if not pdf_bytes:
+            status, headers, body = _json_response(400, {"error": "No PDF file found in request."})
+            start_response(status + " Bad Request", headers)
+            return [body]
+
+        # Debug mode: ?debug=1 returns raw OCR text so you can see what OCR.space produced
+        query = parse_qs(environ.get("QUERY_STRING", ""))
+        if query.get("debug", ["0"])[0] == "1":
+            raw_text = get_pdf_text(pdf_bytes)
+            status, headers, body = _json_response(200, {"debug": True, "raw_ocr_text": raw_text})
+            start_response(status + " OK", headers)
+            return [body]
+
+        result = extract_delivery_order(pdf_bytes)
+        status, headers, body = _json_response(200, result)
+        start_response(status + " OK", headers)
+        return [body]
+
+    except Exception as e:
+        status, headers, body = _json_response(500, {"error": str(e)})
+        start_response(status + " Internal Server Error", headers)
+        return [body]
